@@ -89,65 +89,71 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
     }
   }, [graphName]);
 
-  // --- SAVE (WRITE) ---
+  // --- IMPROVED SAVE FUNCTION ---
   const saveGraph = useCallback(async (nodes: Node[], edges: Edge[]) => {
     if (!currentGraphId) {
-      alert("Error: No graph loaded to save to.");
-      return;
+      alert("Error: No graph loaded.");
+      return false;
     }
     setLoading(true);
 
     try {
-      // 1. Prepare Nodes for DB
-      // Filter out the background map node
+      // 1. Separate New Nodes from Existing Nodes
       const activeNodes = nodes.filter(n => n.id !== 'map-background');
       
-      const dbNodes = activeNodes.map(n => {
-        // If ID is a pure number, it's an update. If it's random string/temp, we treat as new (or let DB handle it if we omit ID)
-        // For simplicity in this Prototype: We assume strict ID matching isn't required for new nodes yet, 
-        // but we need to parse existing IDs.
-        const isNew = isNaN(Number(n.id));
-        
-        return {
-          id: isNew ? undefined : Number(n.id), // Undefined ID = Insert new row
-          graph_id: currentGraphId,
-          x: n.position.x / SCALE_FACTOR, // Convert Pixels -> Meters
-          y: n.position.y / SCALE_FACTOR,
-          name: n.data.label || `node_${Math.floor(Math.random() * 1000)}`,
-          type: (n.data.dbType || 'waypoint') as NodeType,
-          a: 0 // Default orientation
-        };
-      });
+      const newNodes = [];
+      const existingNodes = [];
 
-      // 2. Upsert Nodes (Update existing, Insert new)
-      const { data: savedNodes, error: nodeError } = await supabase
-        .from('wh_nodes')
-        .upsert(dbNodes, { onConflict: 'id' }) // requires 'id' to be present for updates
-        .select();
+      for (const n of activeNodes) {
+        // If ID is purely numeric, it's an existing DB node. Otherwise (e.g. "temp_123"), it's new.
+        if (Number.isInteger(Number(n.id))) {
+          existingNodes.push({
+            id: Number(n.id),
+            graph_id: currentGraphId,
+            x: n.position.x / SCALE_FACTOR,
+            y: n.position.y / SCALE_FACTOR,
+            name: n.data.label,
+            type: (n.data.dbType || 'waypoint') as NodeType,
+            a: 0
+          });
+        } else {
+          // For NEW nodes, we explicitly DO NOT send an 'id' field
+          newNodes.push({
+            graph_id: currentGraphId,
+            x: n.position.x / SCALE_FACTOR,
+            y: n.position.y / SCALE_FACTOR,
+            name: n.data.label || 'New Node',
+            type: (n.data.dbType || 'waypoint') as NodeType,
+            a: 0
+          });
+        }
+      }
 
-      if (nodeError) throw new Error(`Node save failed: ${nodeError.message}`);
-      
-      // Map temporary IDs to real DB IDs (for edges)
-      // This is complex. For now, we assume users hit "Refresh" after adding new nodes 
-      // or we just save existing ones correctly.
-      
-      // 3. Re-create Edges
-      // Strategy: Delete all edges for this graph and re-insert current ones.
-      // This handles deletions and moves easily.
-      
+      // 2. Update Existing Nodes
+      if (existingNodes.length > 0) {
+        const { error: updateError } = await supabase
+          .from('wh_nodes')
+          .upsert(existingNodes);
+        if (updateError) throw new Error(`Update failed: ${updateError.message}`);
+      }
+
+      // 3. Insert New Nodes
+      if (newNodes.length > 0) {
+        const { error: insertError } = await supabase
+          .from('wh_nodes')
+          .insert(newNodes);
+        if (insertError) throw new Error(`Insert failed: ${insertError.message}`);
+      }
+
+      // 4. Save Edges (Delete all & Re-insert strategy)
+      // Note: This only works for edges between EXISTING nodes. 
+      // If you just added a new node, you must save it first (refresh) before connecting edges.
       const { error: deleteError } = await supabase
         .from('wh_edges')
         .delete()
         .eq('graph_id', currentGraphId);
-        
       if (deleteError) throw deleteError;
 
-      // Prepare Edges
-      // We need to map the "Source ID" and "Target ID" to the REAL database IDs.
-      // If you added a new node "temp-1", you can't save an edge to "temp-1". 
-      // *Pro-tip*: For this stage, assume only saving edges between existing (saved) nodes works reliably 
-      // without a full state reload.
-      
       const validEdges = edges.map(e => ({
         graph_id: currentGraphId,
         node_a_id: Number(e.source),
@@ -158,7 +164,6 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
         const { error: edgeError } = await supabase
           .from('wh_edges')
           .insert(validEdges);
-          
         if (edgeError) throw new Error(`Edge save failed: ${edgeError.message}`);
       }
 
