@@ -1,40 +1,45 @@
 # Lertvilai Fleet Management Interface
 
-![Project Status](https://img.shields.io/badge/Status-In%20Development-yellow)
+![Project Status](https://img.shields.io/badge/Status-Prototype%20Complete-green)
 ![Tech Stack](https://img.shields.io/badge/Stack-React%20%7C%20ReactFlow%20%7C%20Supabase-blue)
+![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
 ## Overview
 
-The **Lertvilai Fleet Management Interface** is a web-based control system for managing a fleet of Autonomous Mobile Robots (AMRs) in a warehouse environment.
+The **Lertvilai Fleet Management Interface** is a web-based "Control Room" for managing a fleet of Autonomous Mobile Robots (AMRs) in a warehouse environment.
 
-This repository specifically houses **Program 1: Fleet Interface**, which serves as the central command dashboard. It allows operators to design warehouse maps, define road networks (graphs), solve VRPPD (Vehicle Routing Problem with Pickup and Delivery) optimization tasks, and monitor robot status in real-time.
+This application allows operators to:
+1.  **Design** the warehouse road network (Graph).
+2.  **Plan** tasks using a VRP (Vehicle Routing Problem) optimization engine.
+3.  **Monitor** the fleet in real-time using a digital twin simulation.
 
 ---
 
 ## System Architecture
 
-The Fleet Interface is divided into three main operational tabs:
+The application is structured into three primary operational modules (Tabs):
 
-### 1. Tab 1: Graph Designer (Current Focus)
-* **Purpose:** To define the "Road Network" that robots can traverse.
-* **Functionality:**
-    * Upload and render warehouse floor plans as a background map.
-    * Create **Nodes** (Waypoints) where robots can park or perform tasks.
-    * Draw **Edges** (Paths) to define valid routes between nodes.
-    * **Architecture Role:** Serves as the static database generator for the VRPPD Solver.
+### 1. Graph Designer (Map Builder)
+* **Purpose:** Define the static "Road Network" robots travel on.
+* **Key Features:**
+    * **Map Digitization:** Upload warehouse floor plans (PNG/JPG) as background overlays.
+    * **Tool-Based Editing:** Switch between **Move Mode** (layout adjustment) and **Connect Mode** (path linking).
+    * **Supabase Sync:** Loads and saves graph data (Nodes & Edges) directly to the cloud.
+    * **Centralized Connections:** Uses 360° node handles for clean, straight-line paths.
 
-### 2. Tab 2: Optimization (Upcoming)
-* **Purpose:** To solve Pickup & Delivery tasks using VRPPD algorithms.
-* **Functionality:**
-    * CRUD management of Pickup & Delivery (PD) pairs.
-    * Communication with the **VRPPD Broker** via API to solve routing problems.
-    * Preview solutions before committing them to the fleet.
+### 2. Optimization Engine (Task Planner)
+* **Purpose:** Assign Pickup & Delivery tasks to robots efficiently.
+* **Key Features:**
+    * **Task Queue:** CRUD interface for managing transport requests.
+    * **VRP Solver:** Includes a **Mock Solver** for simulation and hooks for a real C++ VRP backend.
+    * **Route Visualizer:** A read-only map popup to preview the calculated path before dispatching.
 
-### 3. Tab 3: Fleet Controller (Upcoming)
-* **Purpose:** Real-time monitoring and control.
-* **Functionality:**
-    * Visualize robot positions via MQTT streams.
-    * Issue Pause/Stop commands to the fleet.
+### 3. Fleet Controller (Operation Center)
+* **Purpose:** Real-time monitoring and command broadcasting.
+* **Key Features:**
+    * **Simulation Mode:** Built-in "Ghost Robot" engine to test UI responsiveness without hardware.
+    * **MQTT Ready:** Pre-wired architecture to switch from Simulation to Live Telemetry streams.
+    * **Global Commands:** Broadcast Pause, Resume, and Emergency Stop signals.
 
 ---
 
@@ -43,6 +48,7 @@ The Fleet Interface is divided into three main operational tabs:
 ### Prerequisites
 * Node.js (v18+)
 * npm or yarn
+* A valid **Supabase** project URL and Anon Key.
 
 ### Installation
 
@@ -55,33 +61,38 @@ The Fleet Interface is divided into three main operational tabs:
 2.  **Install dependencies**
     ```bash
     npm install
-    # or
-    yarn install
     ```
 
-3.  **Start the development server**
+3.  **Configure Environment**
+    Create a `.env.local` file in the root directory:
+    ```env
+    VITE_SUPABASE_URL=your_supabase_project_url
+    VITE_SUPABASE_ANON_KEY=your_supabase_anon_key
+    ```
+
+4.  **Start the development server**
     ```bash
     npm run dev
-    # or
-    yarn dev
     ```
 
 ---
 
-## Feature Documentation: Graph Designer
+## Usage Guide
 
-The Graph Designer uses **React Flow** to visualize the warehouse graph.
+### Graph Designer (Tab 1)
+* **Move Tool (Cursor Icon):** Select and drag nodes to position them on the map.
+* **Connect Tool (Link Icon):** Click and drag from one node to another to create a blue dotted path.
+* **Upload Map:** Use the upload button to place a floor plan image.
+* **Remove Background:** If a map exists, a red "X" appears to remove it.
 
-### Key Components
+### Optimization (Tab 2)
+1.  **Create Tasks:** Select "Pickup" and "Delivery" locations from the dropdowns on the right.
+2.  **Select & Solve:** Check the boxes next to the tasks you want to bundle and click **"SOLVE SELECTED"**.
+3.  **Preview & Dispatch:** Review the "Route Visualization" popup, then click **"DISPATCH"** to send orders to the fleet.
 
-* **`GraphEditor.tsx`**: The main canvas component. Handles map uploads and state management.
-* **`WaypointNode`**: A custom node component designed as a "Red Dot" with a floating label. It supports bidirectional connections (Source/Target) from all 4 sides (Top, Bottom, Left, Right) to allow flexible path creation.
-
-### How to Use
-1.  **Upload Map:** Click the "Upload Map" button in the top-right toolbar to load your warehouse floor plan.
-2.  **Add Nodes:** Click "Add Node" to spawn a new Waypoint (Red Dot). Drag the center of the dot to move it.
-3.  **Create Edges:** Hover over a Red Dot to reveal 4 white handles. Click and drag from a handle to another node to create a path.
-4.  **Save:** (In Progress) Click "Save Map" to export the graph structure to Supabase.
+### Fleet Controller (Tab 3)
+* **Simulation:** By default, the app runs a physics simulation moving robots between nodes.
+* **Switching to Real Data:** Uncomment the MQTT logic in `src/components/FleetController.tsx` to connect to a live broker.
 
 ---
 
@@ -89,9 +100,22 @@ The Graph Designer uses **React Flow** to visualize the warehouse graph.
 
 ```text
 src/
-├── components/
-│   ├── GraphEditor.tsx       # Main Map Designer Canvas
-│   ├── WaypointNode.tsx      # Custom Node UI (Red Dot)
+├── components/          # UI Modules
+│   ├── GraphEditor.tsx      # Tab 1: Map Designer
+│   ├── Optimization.tsx     # Tab 2: VRP Solver & Task Queue
+│   ├── FleetController.tsx  # Tab 3: Simulation & Monitoring
+│   ├── RouteVisualizer.tsx  # Modal for viewing solved paths
 │   └── ...
-├── App.tsx                   # Main Entry Point
-└── main.tsx                  # React DOM Render
+├── hooks/               # Custom React Hooks (Logic Layer)
+│   ├── useGraphData.ts      # Supabase CRUD for Maps
+│   ├── useTasks.ts          # Supabase CRUD for Tasks
+│   └── useRobotSimulation.ts # Physics engine for Ghost Robots
+├── lib/                 # Configuration
+│   └── supabaseClient.ts    # Singleton DB connection
+├── types/               # TypeScript Definitions
+│   └── database.ts          # DB Schema Interfaces (Nodes, Edges)
+└── utils/               # Helpers
+    └── solverUtils.ts       # Floyd-Warshall Algorithm & Mock VRP
+
+License
+This project is proprietary software developed for Lertvilai.
