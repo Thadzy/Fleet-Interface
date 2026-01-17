@@ -1,24 +1,41 @@
 import { type DBNode, type DBEdge } from '../types/database';
 
-// --- 1. MATH HELPERS (Translator) ---
+// =========================================================
+// 1. MATH & GRAPH HELPERS
+// =========================================================
 
-const getDist = (a: DBNode, b: DBNode) => {
+/**
+ * Calculates Euclidean distance between two nodes.
+ * @returns Distance in raw units (meters in this app).
+ */
+const getDist = (a: DBNode, b: DBNode): number => {
   const dx = a.x - b.x;
   const dy = a.y - b.y;
   return Math.sqrt(dx * dx + dy * dy);
 };
 
+/**
+ * Generates an All-Pairs Shortest Path Matrix using the Floyd-Warshall Algorithm.
+ * * WHY IS THIS NEEDED?
+ * The VRP Solver (OR-Tools) requires a cost matrix where matrix[i][j] represents
+ * the travel cost from Node i to Node j.
+ * * COMPLEXITY WARNING:
+ * This runs in O(n^3). For a warehouse with < 200 nodes, it's instant (~5ms).
+ * For > 500 nodes, this calculation should be moved to the Backend/Server.
+ */
 export const generateDistanceMatrix = (nodes: DBNode[], edges: DBEdge[]): number[][] => {
   const n = nodes.length;
-  // Initialize with generic high cost (Infinity)
+  // Initialize with Infinity (representing no direct path)
   const dist: number[][] = Array(n).fill(null).map(() => Array(n).fill(Infinity));
 
+  // Create a quick lookup map: NodeID -> Matrix Index (0 to n-1)
   const idToIndex = new Map<number, number>();
   nodes.forEach((node, index) => {
     idToIndex.set(node.id, index);
-    dist[index][index] = 0;
+    dist[index][index] = 0; // Distance to self is 0
   });
 
+  // Populate matrix with direct edge weights
   edges.forEach(edge => {
     const u = idToIndex.get(edge.node_a_id);
     const v = idToIndex.get(edge.node_b_id);
@@ -26,14 +43,16 @@ export const generateDistanceMatrix = (nodes: DBNode[], edges: DBEdge[]): number
     const nodeB = nodes.find(n => n.id === edge.node_b_id);
 
     if (u !== undefined && v !== undefined && nodeA && nodeB) {
-      // Scale by 100 to convert meters to cm (integers) for the solver
+      // SCALING: Convert Meters to Centimeters (Integers are faster for solvers)
       const weight = Math.round(getDist(nodeA, nodeB) * 100); 
+      
+      // Assume bidirectional edges for now
       dist[u][v] = weight;
       dist[v][u] = weight;
     }
   });
 
-  // Floyd-Warshall Algorithm (All-pairs shortest path)
+  // Floyd-Warshall Logic: Find shortest path via intermediate node 'k'
   for (let k = 0; k < n; k++) {
     for (let i = 0; i < n; i++) {
       for (let j = 0; j < n; j++) {
@@ -44,71 +63,102 @@ export const generateDistanceMatrix = (nodes: DBNode[], edges: DBEdge[]): number
     }
   }
 
-  // Convert unreachable (Infinity) to -1 for the C++ Solver
+  // Final Polish: Convert remaining Infinity to -1 (standard convention for "unreachable")
   return dist.map(row => row.map(val => (val === Infinity ? -1 : val)));
 };
 
+/**
+ * Formats user-selected tasks into simple [PickupIndex, DeliveryIndex] pairs.
+ * * NOTE: This function attempts to map Task Names back to Node Indices because
+ * the frontend 'Task' object might strictly contain IDs.
+ */
 export const formatTasksForSolver = (tasks: any[], nodes: DBNode[]): number[][] => {
-  const idToIndex = new Map<number, number>();
-  nodes.forEach((node, index) => idToIndex.set(node.id, index));
+  const nameToIndex = new Map<string, number>();
+  nodes.forEach((node, index) => nameToIndex.set(node.name, index));
 
   return tasks.map(t => {
-    // Note: Depends on how your useTasks hook returns data. 
-    // Assuming t.pickup_cell_id maps to a node eventually, 
-    // but for simplicity here we assume we can resolve the Node ID.
-    // In a real app, you might need to fetch the Node ID associated with the Cell ID first.
-    
-    // MOCKING IDs for the prototype if real join data is missing:
-    // This just grabs random nodes if the real map isn't perfect yet.
-    const pickupIdx = idToIndex.get(t.pickup_node_id) || 1; 
-    const deliveryIdx = idToIndex.get(t.delivery_node_id) || 2;
+    // Attempt 1: Try to match by Node Name (Robust)
+    let pickupIdx = nameToIndex.get(t.pickup_name);
+    let deliveryIdx = nameToIndex.get(t.delivery_name);
+
+    // Fallback: If map fails, default to generic indices (0, 1) to prevent crash
+    // In production, this should throw an error or filter out the task.
+    if (pickupIdx === undefined) pickupIdx = 1;
+    if (deliveryIdx === undefined) deliveryIdx = 2;
     
     return [pickupIdx, deliveryIdx];
   });
 };
 
-// --- 2. MOCK SOLVER (Simulation Mode) ---
-// ACTIVE: Use this for development/demo
+// =========================================================
+// 2. MOCK SOLVER (SIMULATION MODE)
+// =========================================================
+
+/**
+ * Simulates a VRP Solver response.
+ * Creates a route that simply visits every requested task in order.
+ * * VISUALIZATION TIP:
+ * Takes the [Pick, Drop] pairs and constructs a sequential path:
+ * Depot -> Pick A -> Drop A -> Pick B -> Drop B -> Depot
+ */
 export const mockSolveVRP = async (matrix: number[][], tasks: number[][]) => {
   console.log("SIMULATION MODE: Solving...", { matrixSize: matrix.length, tasks: tasks.length });
   
-  // Simulate network latency (0.8s)
-  await new Promise(resolve => setTimeout(resolve, 800));
+  // 1. Simulate Network Latency
+  await new Promise(resolve => setTimeout(resolve, 600));
 
-  // Generate a fake route based on the matrix size
-  // It simply visits the first few nodes available in the map
+  // 2. Construct a Dummy Route
+  // Start at Node 0 (Assumed Depot)
   const routeNodes = [0];
-  const maxNode = Math.min(matrix.length - 1, 5); // Don't go out of bounds
-  for(let i=1; i<=maxNode; i++) routeNodes.push(i);
-  routeNodes.push(0); // Return to start
+  let totalDistance = 0;
+  let lastNode = 0;
+
+  // Visit each task sequentially
+  tasks.forEach(([pick, drop]) => {
+    routeNodes.push(pick);
+    totalDistance += matrix[lastNode][pick] > 0 ? matrix[lastNode][pick] : 100;
+    
+    routeNodes.push(drop);
+    totalDistance += matrix[pick][drop] > 0 ? matrix[pick][drop] : 100;
+
+    lastNode = drop;
+  });
+
+  // Return to start
+  routeNodes.push(0);
+  totalDistance += matrix[lastNode][0] > 0 ? matrix[lastNode][0] : 100;
 
   return {
     feasible: true,
-    total_distance: 1250,
-    wall_time_ms: 45,
+    total_distance: totalDistance,
+    wall_time_ms: 45, // Fake computation time
     routes: [
       {
         vehicle_id: 1,
         nodes: routeNodes,
-        distance: 1250
+        distance: totalDistance
       }
     ],
-    summary: "Simulation: Optimal route found using mock logic."
+    summary: "Simulation: Route constructed sequentially for testing."
   };
 };
 
-// --- 3. REAL SOLVER (Production Mode) ---
-// INACTIVE: Switch to this when C++ server is running (localhost:7779)
+// =========================================================
+// 3. REAL SOLVER (PRODUCTION MODE)
+// =========================================================
+
 /*
+// UNCOMMENT THIS WHEN BACKEND IS READY
+// Expects a C++ VRP Broker running on localhost:7779
 export const solveVRP = async (matrix: number[][], tasks: number[][]) => {
-  console.log("🚀 PRODUCTION MODE: Calling VRP Broker...");
+  console.log("PRODUCTION MODE: Calling VRP Broker...");
 
   const payload = {
     distance_matrix: matrix,
     pickups_deliveries: tasks,
-    num_vehicles: 1,
+    num_vehicles: 1, // Currently single agent for prototype
     depot: 0,
-    vehicle_max_distance: 5000,
+    vehicle_max_distance: 100000,
     global_span_cost_coefficient: 100
   };
 

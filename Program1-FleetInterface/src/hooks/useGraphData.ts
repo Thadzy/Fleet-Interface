@@ -1,20 +1,32 @@
-// src/hooks/useGraphData.ts
 import { useState, useCallback } from 'react';
 import { type Node, type Edge, MarkerType } from 'reactflow';
 import { supabase } from '../lib/supabaseClient';
 import { type DBNode, type DBEdge, type NodeType } from '../types/database';
 
-const SCALE_FACTOR = 100; // 1 Meter = 100 Pixels
+/**
+ * CONSTANT: Map Scale Factor
+ * Defines the ratio between Real World Meters and Screen Pixels.
+ * 1 Meter = 100 Pixels.
+ */
+const SCALE_FACTOR = 100;
 
+/**
+ * HOOK: useGraphData
+ * * Manages the CRUD operations for Warehouse Graphs (Nodes & Edges).
+ * * Translates between Supabase Database format and React Flow UI format.
+ * * @param graphName - The unique name of the graph to load (default: 'warehouse_A').
+ */
 export const useGraphData = (graphName: string = 'warehouse_A') => {
   const [loading, setLoading] = useState(false);
   const [currentGraphId, setCurrentGraphId] = useState<number | null>(null);
 
-  // --- FETCH (READ) ---
+  // =========================================================
+  // 1. READ OPERATION (FETCH MAP)
+  // =========================================================
   const loadGraph = useCallback(async () => {
     setLoading(true);
     try {
-      // 1. Get Graph Details
+      // Step A: Get Graph Metadata (ID, Map Image URL)
       const { data: graphData, error: graphError } = await supabase
         .from('wh_graphs')
         .select('*')
@@ -24,7 +36,7 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
       if (graphError || !graphData) throw new Error('Graph not found');
       setCurrentGraphId(graphData.id);
 
-      // 2. Get Nodes
+      // Step B: Get Nodes
       const { data: nodeData, error: nodeError } = await supabase
         .from('wh_nodes')
         .select('*')
@@ -32,7 +44,7 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
 
       if (nodeError) throw nodeError;
 
-      // 3. Get Edges
+      // Step C: Get Edges
       const { data: edgeData, error: edgeError } = await supabase
         .from('wh_edges')
         .select('*')
@@ -40,7 +52,7 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
 
       if (edgeError) throw edgeError;
 
-      // 4. Convert to React Flow Format
+      // Step D: Transform DB Nodes -> React Flow Nodes
       const flowNodes: Node[] = (nodeData as DBNode[]).map((n) => ({
         id: n.id.toString(),
         type: 'waypointNode', 
@@ -48,7 +60,7 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
         data: { label: n.name, dbType: n.type },
       }));
 
-      // Add Map Background
+      // Step E: Inject Background Image (if available)
       if (graphData.map_url) {
         flowNodes.unshift({
           id: 'map-background',
@@ -69,6 +81,7 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
         });
       }
 
+      // Step F: Transform DB Edges -> React Flow Edges
       const flowEdges: Edge[] = (edgeData as DBEdge[]).map((e) => ({
         id: `e${e.node_a_id}-${e.node_b_id}`,
         source: e.node_a_id.toString(),
@@ -81,7 +94,7 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
 
       return { nodes: flowNodes, edges: flowEdges };
 
-    } catch (error) {
+    } catch (error: unknown) {
       console.error('Error loading graph:', error);
       return { nodes: [], edges: [] };
     } finally {
@@ -89,23 +102,26 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
     }
   }, [graphName]);
 
-  // --- IMPROVED SAVE FUNCTION ---
+  // =========================================================
+  // 2. WRITE OPERATION (SAVE MAP)
+  // =========================================================
   const saveGraph = useCallback(async (nodes: Node[], edges: Edge[]) => {
     if (!currentGraphId) {
-      alert("Error: No graph loaded.");
+      alert("Error: No graph loaded. Cannot save.");
       return false;
     }
     setLoading(true);
 
     try {
-      // 1. Separate New Nodes from Existing Nodes
+      // Step A: Filter out UI-only nodes (like the background)
       const activeNodes = nodes.filter(n => n.id !== 'map-background');
       
       const newNodes = [];
       const existingNodes = [];
 
+      // Step B: Categorize Nodes (New vs Existing)
       for (const n of activeNodes) {
-        // If ID is purely numeric, it's an existing DB node. Otherwise (e.g. "temp_123"), it's new.
+        // Numeric ID = Existing in DB. String ID (e.g. "temp_123") = New.
         if (Number.isInteger(Number(n.id))) {
           existingNodes.push({
             id: Number(n.id),
@@ -114,10 +130,10 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
             y: n.position.y / SCALE_FACTOR,
             name: n.data.label,
             type: (n.data.dbType || 'waypoint') as NodeType,
-            a: 0
+            a: 0 // Default angle
           });
         } else {
-          // For NEW nodes, we explicitly DO NOT send an 'id' field
+          // For NEW nodes, we omit 'id' so Postgres generates it
           newNodes.push({
             graph_id: currentGraphId,
             x: n.position.x / SCALE_FACTOR,
@@ -129,7 +145,9 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
         }
       }
 
-      // 2. Update Existing Nodes
+      // Step C: Perform DB Updates
+      
+      // 1. Update Existing
       if (existingNodes.length > 0) {
         const { error: updateError } = await supabase
           .from('wh_nodes')
@@ -137,7 +155,7 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
         if (updateError) throw new Error(`Update failed: ${updateError.message}`);
       }
 
-      // 3. Insert New Nodes
+      // 2. Insert New
       if (newNodes.length > 0) {
         const { error: insertError } = await supabase
           .from('wh_nodes')
@@ -145,15 +163,16 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
         if (insertError) throw new Error(`Insert failed: ${insertError.message}`);
       }
 
-      // 4. Save Edges (Delete all & Re-insert strategy)
-      // Note: This only works for edges between EXISTING nodes. 
-      // If you just added a new node, you must save it first (refresh) before connecting edges.
+      // Step D: Re-sync Edges
+      // Strategy: Delete ALL edges for this graph and re-insert valid ones.
+      // Limitation: Edges connected to "New Nodes" won't save until the node has a real ID.
       const { error: deleteError } = await supabase
         .from('wh_edges')
         .delete()
         .eq('graph_id', currentGraphId);
       if (deleteError) throw deleteError;
 
+      // Filter only edges that connect two valid numeric IDs
       const validEdges = edges.map(e => ({
         graph_id: currentGraphId,
         node_a_id: Number(e.source),
@@ -170,9 +189,10 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
       alert("Map saved successfully!");
       return true;
 
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error('Error saving map:', error);
-      alert(`Save failed: ${error.message}`);
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      alert(`Save failed: ${msg}`);
       return false;
     } finally {
       setLoading(false);

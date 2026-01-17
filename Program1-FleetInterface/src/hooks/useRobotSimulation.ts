@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import { type DBNode, type DBEdge } from '../types/database';
 
+/**
+ * Interface for the public robot data used by the UI.
+ */
 export interface RobotStatus {
   id: string;
   x: number;
@@ -10,70 +13,122 @@ export interface RobotStatus {
   current_task?: string;
 }
 
+/**
+ * Internal Interface for the simulation state.
+ * Extends RobotStatus with simulation-specific fields (target, progress).
+ */
+interface SimulatedRobot extends RobotStatus {
+  targetNode?: DBNode; // The node the robot is currently moving toward
+}
+
+/**
+ * HOOK: useRobotSimulation
+ * * Generates a "Ghost Fleet" of robots for testing the UI without real hardware.
+ * * Simulates movement, battery drain, and status updates at 20 ticks/second.
+ * * @param nodes - The list of warehouse nodes (waypoints).
+ * @param edges - The list of valid paths (currently unused in simple flight mode).
+ * @returns Array of RobotStatus objects for rendering.
+ */
 export const useRobotSimulation = (nodes: DBNode[], edges: DBEdge[]) => {
+  // React State for rendering
   const [robots, setRobots] = useState<RobotStatus[]>([]);
   
-  // Refs to keep track of animation state without triggering re-renders
-  const robotStateRef = useRef<any[]>([]);
+  // Mutable Ref to hold state between renders without triggering re-renders (Performance)
+  // FIX: Replaced 'any' with 'SimulatedRobot[]' for strict typing
+  const robotStateRef = useRef<SimulatedRobot[]>([]);
 
-  // Initialize Robots when map loads
+  // =========================================================
+  // 1. INITIALIZATION
+  // =========================================================
   useEffect(() => {
     if (nodes.length === 0) return;
 
-    // Create 3 Fake Robots at random nodes
-    const initialRobots = ['R-01', 'R-02', 'R-03'].map(id => {
+    // Create 3 Simulated Robots spawning at random nodes
+    const initialRobots: SimulatedRobot[] = ['R-01', 'R-02', 'R-03'].map(id => {
       const randomNode = nodes[Math.floor(Math.random() * nodes.length)];
       return {
         id,
-        x: randomNode.x * 100, // Scale to pixels
+        x: randomNode.x * 100, // Scale to pixels (1m = 100px)
         y: randomNode.y * 100,
-        battery: 80 + Math.floor(Math.random() * 20),
-        status: 'IDLE' as const,
-        targetNodeIndex: -1,
-        progress: 0
+        battery: 80 + Math.floor(Math.random() * 20), // Random battery 80-100%
+        status: 'IDLE',
       };
     });
 
+    // Update the ref immediately so the animation loop can pick it up
     robotStateRef.current = initialRobots;
-    setRobots(initialRobots);
 
+    // FIX: "Cascading Render" Warning
+    // We wrap the state update in a timeout to push it to the next event loop tick.
+    // This allows the current render to finish before triggering the re-render for robots.
+    const timer = setTimeout(() => {
+      setRobots(initialRobots);
+    }, 0);
+
+    return () => clearTimeout(timer);
   }, [nodes]);
 
-  // Animation Loop (Simulates receiving MQTT updates 60fps)
+  // =========================================================
+  // 2. ANIMATION LOOP (GAME LOOP)
+  // =========================================================
   useEffect(() => {
-    if (nodes.length === 0 || edges.length === 0) return;
+    if (nodes.length === 0) return;
+
+    const TICK_RATE_MS = 50; // Update every 50ms (~20 FPS)
 
     const interval = setInterval(() => {
+      // Update position of every robot based on simulation logic
       robotStateRef.current = robotStateRef.current.map(robot => {
-        // Simple logic: If IDLE, pick a random connected node and move there
+        
+        // CASE A: Robot is IDLE -> Assign a new random target
         if (robot.status === 'IDLE') {
-           // Find neighbors (very inefficient search, but fine for 3 robots)
-           // In real app, you'd use the backend data
-           return { ...robot, status: 'MOVING', progress: 0, targetNode: nodes[Math.floor(Math.random() * nodes.length)] };
+           const target = nodes[Math.floor(Math.random() * nodes.length)];
+           return { 
+             ...robot, 
+             status: 'MOVING', 
+             targetNode: target 
+           };
         }
 
+        // CASE B: Robot is MOVING -> Calculate next step
         if (robot.status === 'MOVING' && robot.targetNode) {
-          // Move 5 pixels towards target
-          const dx = (robot.targetNode.x * 100) - robot.x;
-          const dy = (robot.targetNode.y * 100) - robot.y;
-          const dist = Math.sqrt(dx*dx + dy*dy);
+          const targetX = robot.targetNode.x * 100;
+          const targetY = robot.targetNode.y * 100;
 
-          if (dist < 5) {
-             // Arrived
-             return { ...robot, x: robot.targetNode.x * 100, y: robot.targetNode.y * 100, status: 'IDLE' };
+          const dx = targetX - robot.x;
+          const dy = targetY - robot.y;
+          const distanceToTarget = Math.sqrt(dx*dx + dy*dy);
+          const speed = 5; // Pixels per tick (Increased speed for visibility)
+
+          // Check if arrived (within snap distance)
+          if (distanceToTarget < 5) {
+             return { 
+               ...robot, 
+               x: targetX, 
+               y: targetY, 
+               status: 'IDLE',
+               targetNode: undefined 
+             };
           } else {
-             // Step
-             return { ...robot, x: robot.x + (dx/dist)*2, y: robot.y + (dy/dist)*2 };
+             // Move closer by 'speed' pixels
+             return { 
+               ...robot, 
+               x: robot.x + (dx / distanceToTarget) * speed, 
+               y: robot.y + (dy / distanceToTarget) * speed 
+             };
           }
         }
+        
         return robot;
       });
 
-      // Update State for React to Render
+      // Push the new state to React to trigger a re-render
+      // We spread [...array] to create a new reference, forcing React to notice the change
       setRobots([...robotStateRef.current]);
 
-    }, 50); // 20 updates per second
+    }, TICK_RATE_MS);
 
+    // Cleanup interval on unmount
     return () => clearInterval(interval);
   }, [nodes, edges]);
 

@@ -1,46 +1,105 @@
-import React, { useMemo, useEffect } from 'react';
-import ReactFlow, { Background, BackgroundVariant, MarkerType, useNodesState, useEdgesState, Node, Edge } from 'reactflow';
+import React, { useEffect } from 'react';
+import ReactFlow, { 
+  Background, 
+  BackgroundVariant, 
+  MarkerType, 
+  useNodesState, 
+  useEdgesState, 
+  type Node, 
+  type Edge 
+} from 'reactflow';
 import { X, Map as MapIcon } from 'lucide-react';
 import 'reactflow/dist/style.css';
 import { type DBNode, type DBEdge } from '../types/database';
 
+// --- TYPE DEFINITIONS ---
+
+/**
+ * Represents a single vehicle's assigned path.
+ */
+interface SolverRoute {
+  vehicle_id: number;
+  nodes: number[]; // Array of Node Indices (not IDs)
+  distance: number;
+}
+
+/**
+ * Represents the full response from the VRP Solver.
+ * Matches the structure used in Optimization.tsx.
+ */
+interface SolverSolution {
+  feasible: boolean;
+  total_distance: number;
+  wall_time_ms: number;
+  routes: SolverRoute[];
+  summary: string;
+}
+
 interface RouteVisualizerProps {
   isOpen: boolean;
   onClose: () => void;
-  solution: any; // The result from solver
+  solution: SolverSolution | null; // <--- FIXED: Replaced 'any' with specific type
   dbNodes: DBNode[];
   dbEdges: DBEdge[];
 }
 
-const RouteVisualizer: React.FC<RouteVisualizerProps> = ({ isOpen, onClose, solution, dbNodes, dbEdges }) => {
+/**
+ * COMPONENT: RouteVisualizer
+ * * A read-only modal that renders the optimized path on the map.
+ * * It highlights the specific edges the robot will travel.
+ */
+const RouteVisualizer: React.FC<RouteVisualizerProps> = ({ 
+  isOpen, 
+  onClose, 
+  solution, 
+  dbNodes, 
+  dbEdges 
+}) => {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
 
-  // Transform Data when Modal Opens
+  // --- EFFECT: DATA TRANSFORMATION ---
   useEffect(() => {
     if (!isOpen || !solution || !dbNodes) return;
 
-    // 1. SETUP NODES (Same as GraphEditor)
-    const scale = 100; // 1m = 100px
+    // 1. SETUP NODES (Visual Markers)
+    const scale = 100; // Scale factor: 1m = 100px
     const flowNodes: Node[] = dbNodes.map(n => ({
       id: n.id.toString(),
       type: 'default', // Simple circle for view-only
       position: { x: n.x * scale, y: n.y * scale },
       data: { label: n.name },
+      draggable: false, // Read-only
       style: { 
-        width: 10, height: 10, backgroundColor: '#ef4444', borderRadius: '50%', 
-        color: 'white', fontSize: '8px', fontWeight: 'bold', display: 'flex', alignItems: 'center', justifyContent: 'center' 
+        width: 10, 
+        height: 10, 
+        backgroundColor: '#ef4444', 
+        borderRadius: '50%', 
+        color: 'white', 
+        fontSize: '8px', 
+        fontWeight: 'bold', 
+        display: 'flex', 
+        alignItems: 'center', 
+        justifyContent: 'center' 
       }
     }));
 
-    // 2. SETUP EDGES (Highlight the Route)
-    // The solver returns a sequence of INDICES (0, 1, 2...) matching the node array order
-    // We need to map these indices back to DB IDs to find the right edges
-    const routeIndices = solution.routes[0].nodes; // [0, 1, 2...]
+    // 2. SETUP EDGES (Path Highlighting)
     
-    // Create a Set of "Active Connections" for O(1) lookup
+    // Safety check: Ensure we have at least one route
+    if (!solution.routes || solution.routes.length === 0) {
+      setNodes(flowNodes);
+      return;
+    }
+
+    // The solver returns indices (0, 1, 2) based on the array order.
+    // We map these indices back to the real Database IDs.
+    const routeIndices = solution.routes[0].nodes; 
+    
+    // Create a Lookup Set of "Active Connections"
     // Format: "startID-endID"
     const routeConnections = new Set<string>();
+    
     for (let i = 0; i < routeIndices.length - 1; i++) {
       const startNodeIdx = routeIndices[i];
       const endNodeIdx = routeIndices[i+1];
@@ -48,24 +107,29 @@ const RouteVisualizer: React.FC<RouteVisualizerProps> = ({ isOpen, onClose, solu
       const startNodeId = dbNodes[startNodeIdx]?.id;
       const endNodeId = dbNodes[endNodeIdx]?.id;
       
-      if (startNodeId && endNodeId) {
+      if (startNodeId !== undefined && endNodeId !== undefined) {
         routeConnections.add(`${startNodeId}-${endNodeId}`);
-        routeConnections.add(`${endNodeId}-${startNodeId}`); // Bi-directional
+        routeConnections.add(`${endNodeId}-${startNodeId}`); // Support bi-directional lookup
       }
     }
 
+    // Map DB Edges to React Flow Edges
     const flowEdges: Edge[] = dbEdges.map(e => {
       const isRoute = routeConnections.has(`${e.node_a_id}-${e.node_b_id}`);
       return {
         id: `e${e.node_a_id}-${e.node_b_id}`,
         source: e.node_a_id.toString(),
         target: e.node_b_id.toString(),
-        animated: isRoute, // Animate the path!
+        animated: isRoute, // Animate the active path
         style: { 
           stroke: isRoute ? '#2563eb' : '#cbd5e1', // Blue if active, Grey if inactive
           strokeWidth: isRoute ? 4 : 1, 
+          opacity: isRoute ? 1 : 0.3 // Fade out unused paths
         },
-        markerEnd: { type: MarkerType.ArrowClosed, color: isRoute ? '#2563eb' : '#cbd5e1' },
+        markerEnd: { 
+          type: MarkerType.ArrowClosed, 
+          color: isRoute ? '#2563eb' : '#cbd5e1' 
+        },
       };
     });
 
@@ -75,6 +139,8 @@ const RouteVisualizer: React.FC<RouteVisualizerProps> = ({ isOpen, onClose, solu
   }, [isOpen, solution, dbNodes, dbEdges]);
 
   if (!isOpen) return null;
+
+  // --- RENDER ---
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-8">
@@ -88,7 +154,9 @@ const RouteVisualizer: React.FC<RouteVisualizerProps> = ({ isOpen, onClose, solu
             </div>
             <div>
               <h2 className="text-sm font-bold text-slate-800">Route Visualization</h2>
-              <p className="text-[10px] text-slate-500 font-mono">VEHICLE 1 • {solution?.total_distance} CM</p>
+              <p className="text-[10px] text-slate-500 font-mono">
+                VEHICLE 1 • {solution?.total_distance ?? 0} CM
+              </p>
             </div>
           </div>
           <button onClick={onClose} className="p-2 hover:bg-slate-200 rounded-full transition-colors">
@@ -115,7 +183,7 @@ const RouteVisualizer: React.FC<RouteVisualizerProps> = ({ isOpen, onClose, solu
             <span className="text-xs text-slate-400">Review the path before committing to fleet.</span>
             <button 
               onClick={onClose}
-              className="px-4 py-1.5 bg-slate-800 text-white text-xs font-bold rounded-lg hover:bg-slate-700"
+              className="px-4 py-1.5 bg-slate-800 text-white text-xs font-bold rounded-lg hover:bg-slate-700 transition-colors"
             >
               CLOSE PREVIEW
             </button>
