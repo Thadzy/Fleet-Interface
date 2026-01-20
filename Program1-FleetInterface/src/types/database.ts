@@ -34,6 +34,7 @@ export interface DBNode {
   name: string;        // Human-readable label (e.g., "Shelf A-01")
   type: NodeType;      // Functional role
   a: number;           // Orientation/Angle (in Degrees, usually 0-360)
+  level: number;
 }
 
 /**

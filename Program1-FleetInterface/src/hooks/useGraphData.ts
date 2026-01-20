@@ -3,65 +3,56 @@ import { type Node, type Edge, MarkerType } from 'reactflow';
 import { supabase } from '../lib/supabaseClient';
 import { type DBNode, type DBEdge, type NodeType } from '../types/database';
 
-/**
- * CONSTANT: Map Scale Factor
- * Defines the ratio between Real World Meters and Screen Pixels.
- * 1 Meter = 100 Pixels.
- */
 const SCALE_FACTOR = 100;
 
-/**
- * HOOK: useGraphData
- * * Manages the CRUD operations for Warehouse Graphs (Nodes & Edges).
- * * Translates between Supabase Database format and React Flow UI format.
- * * @param graphName - The unique name of the graph to load (default: 'warehouse_A').
- */
-export const useGraphData = (graphName: string = 'warehouse_A') => {
+// CHANGE: Accept 'graphId' (number) instead of string name
+export const useGraphData = (graphId: number) => {
   const [loading, setLoading] = useState(false);
-  const [currentGraphId, setCurrentGraphId] = useState<number | null>(null);
 
   // =========================================================
   // 1. READ OPERATION (FETCH MAP)
   // =========================================================
   const loadGraph = useCallback(async () => {
+    if (!graphId) return { nodes: [], edges: [], mapUrl: null };
+    
     setLoading(true);
     try {
-      // Step A: Get Graph Metadata (ID, Map Image URL)
+      // CHANGE: Query by ID directly
       const { data: graphData, error: graphError } = await supabase
         .from('wh_graphs')
         .select('*')
-        .eq('name', graphName)
+        .eq('id', graphId)
         .single();
 
       if (graphError || !graphData) throw new Error('Graph not found');
-      setCurrentGraphId(graphData.id);
 
-      // Step B: Get Nodes
+      // Get Nodes
       const { data: nodeData, error: nodeError } = await supabase
         .from('wh_nodes')
         .select('*')
-        .eq('graph_id', graphData.id);
+        .eq('graph_id', graphId);
 
       if (nodeError) throw nodeError;
 
-      // Step C: Get Edges
+      // Get Edges
       const { data: edgeData, error: edgeError } = await supabase
         .from('wh_edges')
         .select('*')
-        .eq('graph_id', graphData.id);
+        .eq('graph_id', graphId);
 
       if (edgeError) throw edgeError;
 
-      // Step D: Transform DB Nodes -> React Flow Nodes
+      // Transform Nodes
       const flowNodes: Node[] = (nodeData as DBNode[]).map((n) => ({
         id: n.id.toString(),
         type: 'waypointNode', 
         position: { x: n.x * SCALE_FACTOR, y: n.y * SCALE_FACTOR },
-        data: { label: n.name, dbType: n.type },
+        data: { label: n.name, type: n.type, level: n.level || 0 }, 
       }));
 
-      // Step E: Inject Background Image (if available)
-      if (graphData.map_url) {
+      // Background Image
+      const mapUrl = graphData.map_url; 
+      if (mapUrl) {
         flowNodes.unshift({
           id: 'map-background',
           type: 'group',
@@ -70,7 +61,7 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
           style: {
             width: 3000, 
             height: 2000,
-            backgroundImage: `url(${graphData.map_url})`,
+            backgroundImage: `url(${mapUrl})`,
             backgroundSize: 'contain',
             backgroundRepeat: 'no-repeat',
             zIndex: -10,
@@ -81,7 +72,7 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
         });
       }
 
-      // Step F: Transform DB Edges -> React Flow Edges
+      // Transform Edges
       const flowEdges: Edge[] = (edgeData as DBEdge[]).map((e) => ({
         id: `e${e.node_a_id}-${e.node_b_id}`,
         source: e.node_a_id.toString(),
@@ -92,92 +83,128 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
         markerEnd: { type: MarkerType.ArrowClosed, color: '#3b82f6' },
       }));
 
-      return { nodes: flowNodes, edges: flowEdges };
+      return { nodes: flowNodes, edges: flowEdges, mapUrl };
 
     } catch (error: unknown) {
       console.error('Error loading graph:', error);
-      return { nodes: [], edges: [] };
+      return { nodes: [], edges: [], mapUrl: null };
     } finally {
       setLoading(false);
     }
-  }, [graphName]);
+  }, [graphId]);
 
   // =========================================================
   // 2. WRITE OPERATION (SAVE MAP)
   // =========================================================
   const saveGraph = useCallback(async (nodes: Node[], edges: Edge[]) => {
-    if (!currentGraphId) {
-      alert("Error: No graph loaded. Cannot save.");
+    if (!graphId) {
+      alert("Error: No graph ID loaded. Cannot save.");
       return false;
     }
     setLoading(true);
 
     try {
-      // Step A: Filter out UI-only nodes (like the background)
-      const activeNodes = nodes.filter(n => n.id !== 'map-background');
+      const idMap = new Map<string, number>();
       
-      const newNodes = [];
-      const existingNodes = [];
+      const activeNodes = nodes.filter(n => n.id !== 'map-background');
+      const existingNodesPayload = [];
+      const newNodesPayload = [];
+      const activeDbIds: number[] = []; 
 
-      // Step B: Categorize Nodes (New vs Existing)
       for (const n of activeNodes) {
-        // Numeric ID = Existing in DB. String ID (e.g. "temp_123") = New.
-        if (Number.isInteger(Number(n.id))) {
-          existingNodes.push({
-            id: Number(n.id),
-            graph_id: currentGraphId,
+        const nodeType = (n.data.type || 'waypoint') as NodeType;
+        const nodeLevel = Number(n.data.level) || 0;
+        const numericId = Number(n.id);
+        const isNewNode = isNaN(numericId);
+
+        if (!isNewNode) {
+          idMap.set(n.id, numericId); 
+          activeDbIds.push(numericId);
+
+          existingNodesPayload.push({
+            id: numericId,
+            graph_id: graphId, // Use prop ID
             x: n.position.x / SCALE_FACTOR,
             y: n.position.y / SCALE_FACTOR,
             name: n.data.label,
-            type: (n.data.dbType || 'waypoint') as NodeType,
-            a: 0 // Default angle
+            type: nodeType,
+            a: 0,
+            level: nodeLevel
           });
         } else {
-          // For NEW nodes, we omit 'id' so Postgres generates it
-          newNodes.push({
-            graph_id: currentGraphId,
+          newNodesPayload.push({
+            _tempId: n.id, 
+            graph_id: graphId, // Use prop ID
             x: n.position.x / SCALE_FACTOR,
             y: n.position.y / SCALE_FACTOR,
             name: n.data.label || 'New Node',
-            type: (n.data.dbType || 'waypoint') as NodeType,
-            a: 0
+            type: nodeType,
+            a: 0,
+            level: nodeLevel
           });
         }
       }
 
-      // Step C: Perform DB Updates
-      
-      // 1. Update Existing
-      if (existingNodes.length > 0) {
+      // Cleanup Edges
+      const { error: deleteEdgesError } = await supabase
+        .from('wh_edges')
+        .delete()
+        .eq('graph_id', graphId);
+      if (deleteEdgesError) throw deleteEdgesError;
+
+      // Cleanup Nodes
+      if (activeDbIds.length > 0) {
+        const { error: deleteNodesError } = await supabase
+          .from('wh_nodes')
+          .delete()
+          .eq('graph_id', graphId)
+          .not('id', 'in', `(${activeDbIds.join(',')})`);
+        if (deleteNodesError) throw new Error(`Delete failed: ${deleteNodesError.message}`);
+      } else if (newNodesPayload.length === 0 && existingNodesPayload.length === 0) {
+         // Safe to delete all if list is empty
+         const { error: deleteAllError } = await supabase
+          .from('wh_nodes')
+          .delete()
+          .eq('graph_id', graphId);
+         if (deleteAllError) throw deleteAllError;
+      }
+
+      // Update Existing
+      if (existingNodesPayload.length > 0) {
         const { error: updateError } = await supabase
           .from('wh_nodes')
-          .upsert(existingNodes);
+          .upsert(existingNodesPayload);
         if (updateError) throw new Error(`Update failed: ${updateError.message}`);
       }
 
-      // 2. Insert New
-      if (newNodes.length > 0) {
-        const { error: insertError } = await supabase
+      // Insert New
+      if (newNodesPayload.length > 0) {
+        const dbPayload = newNodesPayload.map(({ _tempId, ...rest }) => rest);
+        const { data: insertedNodes, error: insertError } = await supabase
           .from('wh_nodes')
-          .insert(newNodes);
+          .insert(dbPayload)
+          .select('id'); 
+
         if (insertError) throw new Error(`Insert failed: ${insertError.message}`);
+        if (!insertedNodes) throw new Error("No data returned from insert");
+
+        newNodesPayload.forEach((tempNode, index) => {
+          const realId = insertedNodes[index].id;
+          idMap.set(tempNode._tempId, realId);
+        });
       }
 
-      // Step D: Re-sync Edges
-      // Strategy: Delete ALL edges for this graph and re-insert valid ones.
-      // Limitation: Edges connected to "New Nodes" won't save until the node has a real ID.
-      const { error: deleteError } = await supabase
-        .from('wh_edges')
-        .delete()
-        .eq('graph_id', currentGraphId);
-      if (deleteError) throw deleteError;
-
-      // Filter only edges that connect two valid numeric IDs
-      const validEdges = edges.map(e => ({
-        graph_id: currentGraphId,
-        node_a_id: Number(e.source),
-        node_b_id: Number(e.target)
-      })).filter(e => !isNaN(e.node_a_id) && !isNaN(e.node_b_id));
+      // Save Edges
+      const validEdges = edges.map(e => {
+        const sourceId = idMap.get(e.source);
+        const targetId = idMap.get(e.target);
+        if (sourceId === undefined || targetId === undefined) return null;
+        return {
+          graph_id: graphId,
+          node_a_id: sourceId,
+          node_b_id: targetId
+        };
+      }).filter(Boolean);
 
       if (validEdges.length > 0) {
         const { error: edgeError } = await supabase
@@ -197,7 +224,7 @@ export const useGraphData = (graphName: string = 'warehouse_A') => {
     } finally {
       setLoading(false);
     }
-  }, [currentGraphId]);
+  }, [graphId]);
 
   return { loadGraph, saveGraph, loading };
 };

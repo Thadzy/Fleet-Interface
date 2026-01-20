@@ -1,314 +1,430 @@
-import React, { useEffect, useState, useMemo } from 'react';
-import ReactFlow, { 
-  Background, 
-  BackgroundVariant, 
-  type Node, 
-  type Edge 
+import React, { useCallback, useMemo, useEffect, useState } from 'react';
+import ReactFlow, {
+  Background,
+  Controls,
+  MiniMap,
+  useNodesState,
+  useEdgesState,
+  addEdge,
+  type Connection,
+  type Node,
+  Panel,
+  MarkerType,
+  BackgroundVariant,
+  Handle,
+  Position,
+  type NodeProps,
 } from 'reactflow';
-import { supabase } from '../lib/supabaseClient';
-import { useRobotSimulation } from '../hooks/useRobotSimulation'; // 1. SIMULATION IMPORT
-import { type DBNode, type DBEdge } from '../types/database';
-import { Battery, Activity, PauseCircle, PlayCircle, Octagon } from 'lucide-react';
 import 'reactflow/dist/style.css';
+import {
+  Save,
+  PlusCircle,
+  LayoutGrid,
+  MousePointer2,
+  Trash2,
+  Upload,
+  RefreshCw,
+} from 'lucide-react';
 
-// --- MQTT IMPORTS (UNCOMMENT FOR PRODUCTION) ---
-// import mqtt from 'mqtt'; 
+import { useGraphData } from '../hooks/useGraphData';
+import { supabase } from '../lib/supabaseClient';
+
+// --- HELPER COMPONENTS ---
 
 /**
- * Interface defining the telemetry data structure expected from the robot fleet.
+ * Creates a pair of Source/Target handles for a specific position (Top, Right, Bottom, Left).
+ * This ensures nodes can be connected from any side.
  */
+const CreateHandleInternal = ({
+  pos,
+  id,
+  className,
+  isConnectable,
+}: {
+  pos: Position;
+  id: string;
+  className: string;
+  isConnectable: boolean;
+}) => (
+  <>
+    <Handle
+      type="source"
+      position={pos}
+      id={`${id}-source`}
+      isConnectable={isConnectable}
+      className={className}
+    />
+    <Handle
+      type="target"
+      position={pos}
+      id={`${id}-target`}
+      isConnectable={isConnectable}
+      className={className}
+      style={{ pointerEvents: 'none' }}
+    />
+  </>
+);
 
-// interface RobotStatus {
-//   id: string;
-//   x: number;
-//   y: number;
-//   battery: number;
-//   status: 'IDLE' | 'MOVING' | 'ERROR' | 'CHARGING';
-// }
+// --- CUSTOM NODE DEFINITION ---
 
 /**
- * COMPONENT: FleetController (Tab 3)
- * * Acts as the centralized "Control Room" dashboard.
- * Responsibilities:
- * 1. Fetches and renders the static warehouse map (Nodes & Edges).
- * 2. Visualizes real-time robot positions (overlaying the map).
- * 3. Provides operator controls (Pause, Resume, Emergency Stop).
- * * NOTE: Currently configured to run in SIMULATION mode. 
- * See "Data Source Switcher" section to enable real MQTT telemetry.
+ * Custom Waypoint Node Component.
+ * Visualizes a "Red Dot" draggable node with connection handles on all 4 sides.
+ * Labels are shown in a floating tooltip above the node.
  */
-const FleetController: React.FC = () => {
-  
-  // =========================================================
-  // 1. STATE MANAGEMENT
-  // =========================================================
-
-  // Raw Database Data (Used for logic/simulation)
-  const [dbNodes, setDbNodes] = useState<DBNode[]>([]);
-  const [dbEdges, setDbEdges] = useState<DBEdge[]>([]);
-  
-  // Visual Graph Elements (React Flow specific)
-  const [staticNodes, setStaticNodes] = useState<Node[]>([]);
-  const [edges, setEdges] = useState<Edge[]>([]);
-
-  // Global System State: Controls the operational mode of the fleet
-  const [systemState, setSystemState] = useState<'RUNNING' | 'PAUSED' | 'STOPPED'>('RUNNING');
-
-  // =========================================================
-  // 2. DATA LOADING (STATIC MAP)
-  // =========================================================
-
-  /**
-   * Effect: Load Map Configuration
-   * Fetches the first available map from Supabase and transforms it into 
-   * visual nodes/edges for React Flow.
-   */
-  useEffect(() => {
-    const loadMap = async () => {
-      try {
-        // 1. Fetch the active graph metadata
-        // Note: Currently grabs the first map found. In the future, this could use a specific ID.
-        const { data: graphs } = await supabase.from('wh_graphs').select('id, name').limit(1);
-        
-        if (!graphs || graphs.length === 0) {
-          console.warn('[FleetController] No graphs found in database.');
-          return;
-        }
-
-        const activeGraph = graphs[0];
-        console.log(`[FleetController] Loading Map: ${activeGraph.name}`);
-
-        // 2. Fetch Nodes & Edges associated with this graph
-        const { data: n } = await supabase.from('wh_nodes').select('*').eq('graph_id', activeGraph.id);
-        const { data: e } = await supabase.from('wh_edges').select('*').eq('graph_id', activeGraph.id);
-
-        if (n && e) {
-          // Store raw data for simulation logic
-          setDbNodes(n as DBNode[]);
-          setDbEdges(e as DBEdge[]);
-          
-          // Transform DB Nodes -> React Flow Static Waypoints
-          setStaticNodes((n as DBNode[]).map((node) => ({
-             id: node.id.toString(),
-             type: 'default',
-             position: { x: node.x * 100, y: node.y * 100 }, // Scaling: 1m = 100px
-             data: { label: node.name },
-             style: { width: 10, height: 10, background: '#cbd5e1', border: 'none', fontSize: 8 }
-          })));
-          
-          // Transform DB Edges -> React Flow Paths
-          setEdges((e as DBEdge[]).map((edge) => ({
-             id: `e${edge.node_a_id}-${edge.node_b_id}`,
-             source: edge.node_a_id.toString(),
-             target: edge.node_b_id.toString(),
-             style: { stroke: '#e2e8f0' }
-          })));
-        }
-      } catch (err) { 
-        console.error('[FleetController] Map Load Error:', err); 
-      }
-    };
-
-    loadMap();
-  }, []);
-
-  // =========================================================
-  // 3. ROBOT DATA SOURCE (SWITCHER)
-  // =========================================================
-
-  /**
-   * DATA SOURCE CONFIGURATION
-   * To switch to production (Real Robots), comment out Option A and uncomment Option B.
-   */
-
-  // --- OPTION A: SIMULATION (CURRENTLY ACTIVE) ---
-  // Uses a hook to move "Ghost Robots" along the graph edges for testing UI.
-  const simulatedRobots = useRobotSimulation(dbNodes, dbEdges);
-
-  // --- OPTION B: REAL MQTT TELEMETRY (PREPARED) ---
-  /*
-  const [mqttRobots, setMqttRobots] = useState<RobotStatus[]>([]);
-
-  useEffect(() => {
-    // Initialize MQTT Client (WebSocket Protocol)
-    // Ensure your Broker supports WebSockets (typically port 9001 or 8083)
-    const client = mqtt.connect('ws://localhost:9001/mqtt');
-
-    client.on('connect', () => {
-      console.log('Connected to MQTT Broker');
-      client.subscribe('fleet/status');
-    });
-
-    client.on('message', (topic, message) => {
-      if (topic === 'fleet/status') {
-        try {
-            const payload = JSON.parse(message.toString());
-            // Expected Format: { "robots": [ { "id": "R-01", "x": 100, "y": 200, ... } ] }
-            if (payload.robots) {
-                setMqttRobots(payload.robots);
-            }
-        } catch (e) {
-            console.error('MQTT JSON Parse Error', e);
-        }
-      }
-    });
-
-    return () => {
-      if (client) client.end();
-    };
-  }, []);
-  */
-
-  // --- ACTIVE DATA SELECTOR ---
-  const activeRobots = simulatedRobots; 
-  // const activeRobots = mqttRobots; // <--- UNCOMMENT THIS FOR PRODUCTION
-
-  // =========================================================
-  // 4. VISUALIZATION LOGIC
-  // =========================================================
-
-  /**
-   * Memoized computation of Dynamic Robot Nodes.
-   * * PERFORMANCE OPTIMIZATION:
-   * We use useMemo here instead of useEffect + useState.
-   * This calculates the visual state of robots *during* the render cycle,
-   * preventing the "Cascading Render" performance issue.
-   */
-  const robotNodes = useMemo(() => {
-    return activeRobots.map((r) => ({
-      id: r.id,
-      type: 'default', // Using default circle node for now
-      position: { x: r.x, y: r.y },
-      data: { label: r.id },
-      draggable: false,
-      style: {
-        width: 40,
-        height: 40,
-        // Visual Feedback Logic:
-        // - RED: If System Stopped OR Robot Error
-        // - BLUE: Normal Operation
-        backgroundColor: systemState === 'STOPPED' 
-          ? '#ef4444' 
-          : (r.status === 'ERROR' ? '#ef4444' : '#2563eb'),
-        color: 'white',
-        borderRadius: '50%',
-        border: '3px solid white',
-        boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        fontWeight: 'bold',
-        fontSize: '10px',
-        zIndex: 1000, // Ensure robots render ON TOP of map nodes
-        transition: 'all 0.05s linear', // Smooths out low-tick-rate updates
-        opacity: systemState === 'PAUSED' ? 0.5 : 1 // Dim robots when paused
-      }
-    }));
-  }, [activeRobots, systemState]);
-
-  // =========================================================
-  // 5. COMMAND HANDLERS
-  // =========================================================
-
-  /**
-   * Broadcasts high-level commands to the fleet.
-   * @param cmd - The command type ('PAUSE', 'RESUME', 'STOP')
-   */
-  const sendCommand = (cmd: 'PAUSE' | 'RESUME' | 'STOP') => {
-    // 1. Simulation Logic (Console Log)
-    console.log(`[COMMAND ISSUED] Type: ${cmd}`);
-
-    // 2. Optimistic UI Update (Immediate feedback for user)
-    if (cmd === 'PAUSE') setSystemState('PAUSED');
-    if (cmd === 'RESUME') setSystemState('RUNNING');
-    if (cmd === 'STOP') setSystemState('STOPPED');
-
-    // 3. Real MQTT Logic (Prepared)
-    /*
-    // Example publication logic:
-    if (mqttClient.connected) {
-        mqttClient.publish('fleet/control', JSON.stringify({ 
-            command: cmd,
-            timestamp: Date.now() 
-        }));
-    }
-    */
-  };
-
-  // =========================================================
-  // 6. RENDER
-  // =========================================================
+const WaypointNode = ({ data, isConnectable }: NodeProps) => {
+  // Styles for the connection handles (hidden by default, shown on hover)
+  const handleStyle =
+    'w-3 h-3 !bg-white !border-2 !border-blue-500 !rounded-full opacity-0 group-hover:opacity-100 transition-opacity z-50';
 
   return (
-    <div className="flex h-full bg-slate-100">
-       
-       {/* --- LEFT SIDEBAR: CONTROL PANEL --- */}
-       <div className="w-64 bg-white border-r border-slate-200 p-4 flex flex-col gap-6 z-10 shadow-sm">
-          
-          {/* Status Indicator Widget */}
-          <div>
-            <h2 className="text-sm font-bold text-slate-800 flex items-center gap-2 mb-3">
-              <Activity size={18} className={systemState === 'RUNNING' ? "text-green-500" : "text-red-500"} />
-              Fleet Status
-            </h2>
-            <div className={`p-3 rounded-lg border text-center font-bold text-xs ${
-                systemState === 'RUNNING' ? 'bg-green-50 border-green-200 text-green-700' :
-                systemState === 'PAUSED' ? 'bg-yellow-50 border-yellow-200 text-yellow-700' :
-                'bg-red-50 border-red-200 text-red-700'
-            }`}>
-                SYSTEM {systemState}
-            </div>
-          </div>
+    <div className="group relative flex flex-col items-center justify-center">
+      {/* Label Tooltip */}
+      <div className="absolute -top-7 whitespace-nowrap bg-slate-900/90 text-white text-[10px] font-bold px-2 py-1 rounded shadow-sm backdrop-blur-sm pointer-events-none">
+        {data.label}
+      </div>
+      
+      {/* Visual Dot */}
+      <div className="w-5 h-5 bg-red-600 rounded-full border-[3px] border-white shadow-lg cursor-move z-20" />
 
-          {/* Active Robots List */}
-          <div className="space-y-3 flex-1 overflow-y-auto">
-            {activeRobots.map(r => (
-              <div key={r.id} className="p-3 border border-slate-100 rounded-lg bg-slate-50">
-                <div className="flex justify-between items-center mb-2">
-                   <span className="font-bold text-xs text-slate-700">{r.id}</span>
-                   <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-200 text-slate-600">{r.status}</span>
-                </div>
-                <div className="flex items-center gap-2 text-xs text-slate-500">
-                   <Battery size={14} />
-                   <div className="flex-1 h-1.5 bg-slate-200 rounded-full overflow-hidden">
-                     <div className="h-full bg-green-500" style={{ width: `${r.battery}%` }}></div>
-                   </div>
-                   <span>{r.battery}%</span>
-                </div>
-              </div>
-            ))}
-          </div>
-
-          {/* Operator Controls */}
-          <div className="space-y-2 pt-4 border-t border-slate-100">
-             <label className="text-[10px] font-bold text-slate-400 uppercase">Broadcast Commands</label>
-             <div className="grid grid-cols-2 gap-2">
-                <button onClick={() => sendCommand('PAUSE')} className="flex flex-col items-center justify-center p-2 bg-slate-100 hover:bg-yellow-100 text-slate-600 hover:text-yellow-700 rounded transition-colors">
-                   <PauseCircle size={20} className="mb-1"/> <span className="text-[10px] font-bold">PAUSE</span>
-                </button>
-                <button onClick={() => sendCommand('RESUME')} className="flex flex-col items-center justify-center p-2 bg-slate-100 hover:bg-green-100 text-slate-600 hover:text-green-700 rounded transition-colors">
-                   <PlayCircle size={20} className="mb-1"/> <span className="text-[10px] font-bold">RESUME</span>
-                </button>
-             </div>
-             <button onClick={() => sendCommand('STOP')} className="w-full flex items-center justify-center gap-2 p-3 bg-red-50 text-red-600 hover:bg-red-600 hover:text-white rounded-lg font-bold text-xs transition-colors">
-                <Octagon size={16}/> EMERGENCY STOP
-             </button>
-          </div>
-       </div>
-
-       {/* --- RIGHT PANEL: MAP VISUALIZATION --- */}
-       <div className="flex-1 relative">
-         <ReactFlow 
-            // MERGE: Combine Static Waypoints with Dynamic Robot Nodes
-            nodes={[...staticNodes, ...robotNodes]} 
-            edges={edges} 
-            fitView 
-            minZoom={0.1}
-         >
-            <Background color="#cbd5e1" gap={20} size={1} variant={BackgroundVariant.Dots} />
-         </ReactFlow>
-       </div>
+      {/* Connection Handles (Top, Bottom, Right, Left) */}
+      <CreateHandleInternal
+        pos={Position.Top}
+        id="top"
+        className={`${handleStyle} -top-1.5`}
+        isConnectable={isConnectable}
+      />
+      <CreateHandleInternal
+        pos={Position.Bottom}
+        id="bottom"
+        className={`${handleStyle} -bottom-1.5`}
+        isConnectable={isConnectable}
+      />
+      <CreateHandleInternal
+        pos={Position.Right}
+        id="right"
+        className={`${handleStyle} -right-1.5`}
+        isConnectable={isConnectable}
+      />
+      <CreateHandleInternal
+        pos={Position.Left}
+        id="left"
+        className={`${handleStyle} -left-1.5`}
+        isConnectable={isConnectable}
+      />
     </div>
   );
 };
 
-export default FleetController;
+// --- MAIN COMPONENT ---
+
+/**
+ * COMPONENT: GraphEditor (Tab 1)
+ * * The core visual editor for designing warehouse layouts.
+ * Responsibilities:
+ * 1. Load/Save graph data (Nodes/Edges) to Supabase.
+ * 2. Upload and display warehouse floorplans (images).
+ * 3. Provide tools to Add, Delete, and Connect nodes visually.
+ */
+const GraphEditor: React.FC = () => {
+  // Define custom node types for React Flow
+  const nodeTypes = useMemo(() => ({ waypointNode: WaypointNode }), []);
+  
+  // React Flow State (Nodes & Edges)
+  const [nodes, setNodes, onNodesChange] = useNodesState([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+
+  // =========================================================
+  // 1. STATE MANAGEMENT (MAP SELECTION)
+  // =========================================================
+  const [mapList, setMapList] = useState<string[]>([]);
+  const [currentMap, setCurrentMap] = useState<string>('warehouse_A');
+  const [uploading, setUploading] = useState(false);
+
+  // =========================================================
+  // 2. DATA LOADING
+  // =========================================================
+
+  // Fetch list of available map names on mount
+  useEffect(() => {
+    const fetchMaps = async () => {
+      const { data } = await supabase.from('wh_graphs').select('name');
+      if (data) {
+        setMapList(data.map((d) => d.name));
+      }
+    };
+    fetchMaps();
+  }, []);
+
+  // Use Custom Hook to manage DB operations for the *current* map
+  const { loadGraph, saveGraph, loading } = useGraphData(currentMap);
+
+  // Load Graph Data whenever the selected map changes
+  useEffect(() => {
+    const fetchData = async () => {
+      const { nodes: dbNodes, edges: dbEdges } = await loadGraph();
+      // Always set nodes/edges (even if empty) to clear the canvas between map switches
+      setNodes(dbNodes);
+      setEdges(dbEdges);
+    };
+    fetchData();
+  }, [loadGraph, setNodes, setEdges]); 
+
+  // =========================================================
+  // 3. EDITOR ACTIONS
+  // =========================================================
+
+  /**
+   * Handle creating connections between nodes.
+   * Adds a styled "Edge" (dotted blue line) when user drags between handles.
+   */
+  const onConnect = useCallback(
+    (params: Connection) => {
+      const newEdge = {
+        ...params,
+        type: 'straight',
+        animated: true,
+        style: { stroke: '#3b82f6', strokeWidth: 2, strokeDasharray: '5,5' },
+        markerEnd: { type: MarkerType.ArrowClosed, color: '#3b82f6' },
+      };
+      setEdges((eds) => addEdge(newEdge, eds));
+    },
+    [setEdges]
+  );
+
+  /**
+   * Add a new "Waypoint" node to the canvas.
+   * Uses a temporary ID (timestamp) which is replaced by a real DB ID upon saving.
+   */
+  const addNode = () => {
+    const id = `temp_${Date.now()}`;
+    const newNode: Node = {
+      id,
+      type: 'waypointNode',
+      position: {
+        x: 400 + Math.random() * 100, // Random offset to avoid stacking
+        y: 300 + Math.random() * 100,
+      },
+      data: { label: `NEW` },
+    };
+    setNodes((nds) => nds.concat(newNode));
+  };
+
+  /**
+   * Delete ONLY the currently selected nodes/edges.
+   * Filters the state array to remove items where `selected === true`.
+   */
+  const handleDelete = useCallback(() => {
+    setNodes((nds) => nds.filter((node) => !node.selected));
+    setEdges((eds) => eds.filter((edge) => !edge.selected));
+  }, [setNodes, setEdges]);
+
+  /**
+   * Uploads a new map background image to Supabase Storage.
+   * Updates the `wh_graphs` table with the new public URL.
+   */
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    try {
+      setUploading(true); 
+
+      // 1. Upload file to 'maps' bucket
+      const fileName = `map_${Date.now()}_${file.name.replace(/\s/g, '')}`;
+      // FIX: Removed unused 'uploadData' variable to satisfy linter
+      const { error: uploadError } = await supabase.storage
+        .from('maps')
+        .upload(fileName, file);
+
+      if (uploadError) throw uploadError;
+
+      // 2. Get Public URL
+      const { data: { publicUrl } } = supabase.storage
+        .from('maps')
+        .getPublicUrl(fileName);
+
+      // 3. Update Database Record
+      const { error: dbError } = await supabase
+        .from('wh_graphs')
+        .update({ map_url: publicUrl })
+        .eq('name', currentMap);
+
+      if (dbError) throw dbError;
+
+      alert('Map uploaded successfully!');
+
+      // 4. Reload Graph to show new background
+      const { nodes: newNodes, edges: newEdges } = await loadGraph();
+      setNodes(newNodes);
+      setEdges(newEdges);
+
+    } catch (error: unknown) {
+      console.error('Upload failed:', error);
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      alert(`Upload failed: ${msg}`);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  // =========================================================
+  // 4. RENDER
+  // =========================================================
+
+  return (
+    <div className="w-full h-full bg-slate-50 relative font-sans">
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        nodeTypes={nodeTypes}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onConnect={onConnect}
+        fitView
+        minZoom={0.1}
+        maxZoom={4}
+        defaultEdgeOptions={{ type: 'straight' }}
+      >
+        <Background
+          color="#cbd5e1"
+          gap={20}
+          size={1}
+          variant={BackgroundVariant.Dots}
+        />
+
+        {/* --- PANEL: HEADER & MAP SELECTOR --- */}
+        <Panel position="top-left" className="m-4">
+          <div className="bg-white/90 backdrop-blur border border-slate-200 shadow-sm px-4 py-3 rounded-xl flex items-center gap-3">
+            <div className="p-2 bg-slate-100 rounded-lg text-slate-600">
+              <LayoutGrid size={20} />
+            </div>
+            <div>
+              <h2 className="text-sm font-bold text-slate-800 leading-tight">
+                Map Designer
+              </h2>
+
+              <select
+                value={currentMap}
+                onChange={(e) => setCurrentMap(e.target.value)}
+                className="text-[10px] text-slate-500 font-mono bg-transparent border-none outline-none cursor-pointer hover:text-blue-600"
+              >
+                {mapList.map((name) => (
+                  <option key={name} value={name}>
+                    EDITING: {name.toUpperCase()}
+                  </option>
+                ))}
+              </select>
+
+              <div className="h-6 w-px bg-slate-200 mx-1"></div>
+              {/* Sync Status Indicator */}
+              <div className="flex items-center gap-2 text-[10px] text-slate-400 font-mono">
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    loading || uploading
+                      ? 'bg-yellow-500 animate-ping'
+                      : 'bg-green-500'
+                  }`}
+                ></span>
+                {loading || uploading ? 'SYNCING...' : 'ONLINE'}
+              </div>
+            </div>
+          </div>
+        </Panel>
+
+        {/* --- PANEL: TOOLBAR --- */}
+        <Panel position="top-right" className="m-4">
+          <div className="bg-white/90 backdrop-blur border border-slate-200 shadow-lg rounded-xl p-1.5 flex gap-1">
+            <div className="flex gap-1 pr-2 border-r border-slate-200 items-center">
+              {/* File Upload Button */}
+              <label className="cursor-pointer p-2 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all group relative">
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={handleFileUpload}
+                />
+                <Upload size={18} />
+              </label>
+
+              <button className="p-2 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all">
+                <MousePointer2 size={18} />
+              </button>
+
+              <button
+                onClick={addNode}
+                className="p-2 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all"
+                title="Add Waypoint"
+              >
+                <PlusCircle size={18} />
+              </button>
+
+              <button
+                onClick={handleDelete}
+                className="p-2 text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                title="Delete Selected (Backspace)"
+              >
+                <Trash2 size={18} />
+              </button>
+            </div>
+
+            <div className="flex gap-1 pl-1">
+              {/* Refresh Button */}
+              <button
+                onClick={async () => {
+                  const { nodes: dbNodes, edges: dbEdges } = await loadGraph();
+                  setNodes(dbNodes);
+                  setEdges(dbEdges);
+                }}
+                className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-all"
+              >
+                <RefreshCw
+                  size={18}
+                  className={loading ? 'animate-spin' : ''}
+                />
+              </button>
+
+              {/* SAVE BUTTON */}
+              <button
+                onClick={async () => {
+                  const success = await saveGraph(nodes, edges);
+                  if (success) {
+                    // Reload to replace temporary IDs with real DB IDs
+                    const { nodes: dbNodes, edges: dbEdges } = await loadGraph();
+                    setNodes(dbNodes);
+                    setEdges(dbEdges);
+                  }
+                }}
+                className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 text-white text-xs font-bold rounded-lg hover:bg-slate-700 shadow-md transition-all active:translate-y-0.5"
+              >
+                <Save size={14} />
+                <span>SAVE MAP</span>
+              </button>
+            </div>
+          </div>
+        </Panel>
+
+        {/* --- PANEL: STATUS BAR --- */}
+        <Panel position="bottom-center" className="mb-2">
+          <div className="bg-slate-800/90 backdrop-blur text-slate-300 text-[10px] font-mono px-4 py-1.5 rounded-full flex gap-4 shadow-lg border border-slate-700">
+            <span>
+              NODES: {nodes.filter((n) => n.id !== 'map-background').length}
+            </span>
+            <span className="text-slate-600">|</span>
+            <span>EDGES: {edges.length}</span>
+            <span className="text-slate-600">|</span>
+            <span>ZOOM: 100%</span>
+          </div>
+        </Panel>
+
+        <Controls />
+        <MiniMap
+          className="!bg-slate-100 border border-slate-300 rounded-lg"
+          nodeColor={(n) => (n.type === 'waypointNode' ? '#ef4444' : '#e2e8f0')}
+        />
+      </ReactFlow>
+    </div>
+  );
+};
+
+export default GraphEditor;
