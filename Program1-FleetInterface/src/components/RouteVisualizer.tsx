@@ -1,12 +1,12 @@
 import React, { useEffect } from 'react';
-import ReactFlow, { 
-  Background, 
-  BackgroundVariant, 
-  MarkerType, 
-  useNodesState, 
-  useEdgesState, 
-  type Node, 
-  type Edge 
+import ReactFlow, {
+  Background,
+  BackgroundVariant,
+  MarkerType,
+  useNodesState,
+  useEdgesState,
+  type Node,
+  type Edge
 } from 'reactflow';
 import { X, Map as MapIcon } from 'lucide-react';
 import 'reactflow/dist/style.css';
@@ -19,7 +19,8 @@ import { type DBNode, type DBEdge } from '../types/database';
  */
 interface SolverRoute {
   vehicle_id: number;
-  nodes: number[]; // Array of Node Indices (not IDs)
+  steps?: any[];
+  nodes?: number[];
   distance: number;
 }
 
@@ -48,12 +49,12 @@ interface RouteVisualizerProps {
  * * A read-only modal that renders the optimized path on the map.
  * * It highlights the specific edges the robot will travel.
  */
-const RouteVisualizer: React.FC<RouteVisualizerProps> = ({ 
-  isOpen, 
-  onClose, 
-  solution, 
-  dbNodes, 
-  dbEdges 
+const RouteVisualizer: React.FC<RouteVisualizerProps> = ({
+  isOpen,
+  onClose,
+  solution,
+  dbNodes,
+  dbEdges
 }) => {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
@@ -70,46 +71,57 @@ const RouteVisualizer: React.FC<RouteVisualizerProps> = ({
       position: { x: n.x * scale, y: n.y * scale },
       data: { label: n.name },
       draggable: false, // Read-only
-      style: { 
-        width: 10, 
-        height: 10, 
-        backgroundColor: '#ef4444', 
-        borderRadius: '50%', 
-        color: 'white', 
-        fontSize: '8px', 
-        fontWeight: 'bold', 
-        display: 'flex', 
-        alignItems: 'center', 
-        justifyContent: 'center' 
+      style: {
+        width: 10,
+        height: 10,
+        backgroundColor: '#ef4444',
+        borderRadius: '50%',
+        color: 'white',
+        fontSize: '8px',
+        fontWeight: 'bold',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center'
       }
     }));
 
     // 2. SETUP EDGES (Path Highlighting)
-    
+
     // Safety check: Ensure we have at least one route
     if (!solution.routes || solution.routes.length === 0) {
       setNodes(flowNodes);
       return;
     }
 
-    // The solver returns indices (0, 1, 2) based on the array order.
-    // We map these indices back to the real Database IDs.
-    const routeIndices = solution.routes[0].nodes; 
-    
+    // The solver returns complex steps now (RouteStep[]).
+    // We map these to find the path.
+    const routeSteps = solution.routes[0].steps || []; // Use steps if available
+    const routeNodes = solution.routes[0].nodes || []; // Fallback (though likely empty or unused)
+
     // Create a Lookup Set of "Active Connections"
     // Format: "startID-endID"
     const routeConnections = new Set<string>();
-    
-    for (let i = 0; i < routeIndices.length - 1; i++) {
-      const startNodeIdx = routeIndices[i];
-      const endNodeIdx = routeIndices[i+1];
-      
-      const startNodeId = dbNodes[startNodeIdx]?.id;
-      const endNodeId = dbNodes[endNodeIdx]?.id;
-      
-      if (startNodeId !== undefined && endNodeId !== undefined) {
-        routeConnections.add(`${startNodeId}-${endNodeId}`);
-        routeConnections.add(`${endNodeId}-${startNodeId}`); // Support bi-directional lookup
+
+    // Logic for Steps (New)
+    if (routeSteps.length > 0) {
+      for (let i = 0; i < routeSteps.length - 1; i++) {
+        const startId = routeSteps[i].node_id;
+        const endId = routeSteps[i + 1].node_id;
+        routeConnections.add(`${startId}-${endId}`);
+        routeConnections.add(`${endId}-${startId}`);
+      }
+    }
+    // Logic for Nodes Array (Old/Fallback)
+    else if (routeNodes.length > 0) {
+      for (let i = 0; i < routeNodes.length - 1; i++) {
+        const startNodeIdx = routeNodes[i];
+        const endNodeIdx = routeNodes[i + 1];
+        const startId = dbNodes[startNodeIdx]?.id;
+        const endId = dbNodes[endNodeIdx]?.id;
+        if (startId && endId) {
+          routeConnections.add(`${startId}-${endId}`);
+          routeConnections.add(`${endId}-${startId}`);
+        }
       }
     }
 
@@ -121,14 +133,14 @@ const RouteVisualizer: React.FC<RouteVisualizerProps> = ({
         source: e.node_a_id.toString(),
         target: e.node_b_id.toString(),
         animated: isRoute, // Animate the active path
-        style: { 
+        style: {
           stroke: isRoute ? '#2563eb' : '#cbd5e1', // Blue if active, Grey if inactive
-          strokeWidth: isRoute ? 4 : 1, 
+          strokeWidth: isRoute ? 4 : 1,
           opacity: isRoute ? 1 : 0.3 // Fade out unused paths
         },
-        markerEnd: { 
-          type: MarkerType.ArrowClosed, 
-          color: isRoute ? '#2563eb' : '#cbd5e1' 
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+          color: isRoute ? '#2563eb' : '#cbd5e1'
         },
       };
     });
@@ -145,7 +157,7 @@ const RouteVisualizer: React.FC<RouteVisualizerProps> = ({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-8">
       <div className="bg-white w-full h-full max-w-6xl max-h-[80vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden animate-in zoom-in-95 duration-200">
-        
+
         {/* Header */}
         <div className="h-14 border-b border-slate-100 flex items-center justify-between px-6 bg-slate-50">
           <div className="flex items-center gap-2">
@@ -180,13 +192,13 @@ const RouteVisualizer: React.FC<RouteVisualizerProps> = ({
 
         {/* Footer */}
         <div className="h-12 border-t border-slate-100 flex items-center justify-end px-6 bg-white gap-3">
-            <span className="text-xs text-slate-400">Review the path before committing to fleet.</span>
-            <button 
-              onClick={onClose}
-              className="px-4 py-1.5 bg-slate-800 text-white text-xs font-bold rounded-lg hover:bg-slate-700 transition-colors"
-            >
-              CLOSE PREVIEW
-            </button>
+          <span className="text-xs text-slate-400">Review the path before committing to fleet.</span>
+          <button
+            onClick={onClose}
+            className="px-4 py-1.5 bg-slate-800 text-white text-xs font-bold rounded-lg hover:bg-slate-700 transition-colors"
+          >
+            CLOSE PREVIEW
+          </button>
         </div>
       </div>
     </div>

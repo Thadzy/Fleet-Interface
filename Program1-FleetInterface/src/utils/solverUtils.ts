@@ -44,8 +44,8 @@ export const generateDistanceMatrix = (nodes: DBNode[], edges: DBEdge[]): number
 
     if (u !== undefined && v !== undefined && nodeA && nodeB) {
       // SCALING: Convert Meters to Centimeters (Integers are faster for solvers)
-      const weight = Math.round(getDist(nodeA, nodeB) * 100); 
-      
+      const weight = Math.round(getDist(nodeA, nodeB) * 100);
+
       // Assume bidirectional edges for now
       dist[u][v] = weight;
       dist[v][u] = weight;
@@ -85,7 +85,7 @@ export const formatTasksForSolver = (tasks: any[], nodes: DBNode[]): number[][] 
     // In production, this should throw an error or filter out the task.
     if (pickupIdx === undefined) pickupIdx = 1;
     if (deliveryIdx === undefined) deliveryIdx = 2;
-    
+
     return [pickupIdx, deliveryIdx];
   });
 };
@@ -101,45 +101,84 @@ export const formatTasksForSolver = (tasks: any[], nodes: DBNode[]): number[][] 
  * Takes the [Pick, Drop] pairs and constructs a sequential path:
  * Depot -> Pick A -> Drop A -> Pick B -> Drop B -> Depot
  */
-export const mockSolveVRP = async (matrix: number[][], tasks: number[][]) => {
-  console.log("SIMULATION MODE: Solving...", { matrixSize: matrix.length, tasks: tasks.length });
-  
+/**
+ * Step in a VRP Route.
+ */
+export interface RouteStep {
+  type: 'move' | 'pickup' | 'dropoff';
+  node_id: number;
+  request_id?: number;
+  cell_id?: number; // Corresponding cell_id for the action
+}
+
+/**
+ * Simulates a VRP Solver response.
+ * Creates a route that simply visits every requested task in order.
+ */
+export const mockSolveVRP = async (_matrix: number[][], tasks: any[], nodes: DBNode[], cells: any[]) => { // Added nodes/cells to context
+  console.log("SIMULATION MODE: Solving...", { tasks: tasks.length });
+
   // 1. Simulate Network Latency
   await new Promise(resolve => setTimeout(resolve, 600));
 
   // 2. Construct a Dummy Route
-  // Start at Node 0 (Assumed Depot)
-  const routeNodes = [0];
+  // Start at Depot
+  const depotNode = nodes.find(n => n.type === 'depot') || nodes[0];
+  const routeSteps: RouteStep[] = [];
+
+  // Initial Move
+  routeSteps.push({ type: 'move', node_id: depotNode.id });
+
   let totalDistance = 0;
-  let lastNode = 0;
+  let lastNodeId = depotNode.id;
 
   // Visit each task sequentially
-  tasks.forEach(([pick, drop]) => {
-    routeNodes.push(pick);
-    totalDistance += matrix[lastNode][pick] > 0 ? matrix[lastNode][pick] : 100;
-    
-    routeNodes.push(drop);
-    totalDistance += matrix[pick][drop] > 0 ? matrix[pick][drop] : 100;
+  tasks.forEach((task) => {
+    // Pickup Step
+    // Find node ID for this pickup cell
+    const pickupCell = cells.find(c => c.id === task.pickup_cell_id);
+    const pickupNodeId = pickupCell ? pickupCell.node_id : lastNodeId;
 
-    lastNode = drop;
+    routeSteps.push({
+      type: 'pickup',
+      node_id: pickupNodeId,
+      request_id: task.id,
+      cell_id: task.pickup_cell_id
+    });
+
+    // Add distance (mock)
+    totalDistance += 500; // Arbitrary distance
+
+    // Delivery Step
+    const deliveryCell = cells.find(c => c.id === task.delivery_cell_id);
+    const deliveryNodeId = deliveryCell ? deliveryCell.node_id : pickupNodeId;
+
+    routeSteps.push({
+      type: 'dropoff',
+      node_id: deliveryNodeId,
+      request_id: task.id,
+      cell_id: task.delivery_cell_id
+    });
+
+    totalDistance += 500;
+    lastNodeId = deliveryNodeId;
   });
 
   // Return to start
-  routeNodes.push(0);
-  totalDistance += matrix[lastNode][0] > 0 ? matrix[lastNode][0] : 100;
+  routeSteps.push({ type: 'move', node_id: depotNode.id });
 
   return {
     feasible: true,
     total_distance: totalDistance,
-    wall_time_ms: 45, // Fake computation time
+    wall_time_ms: 45,
     routes: [
       {
-        vehicle_id: 1,
-        nodes: routeNodes,
+        vehicle_id: 1, // Mock Assigned Robot
+        steps: routeSteps,
         distance: totalDistance
       }
     ],
-    summary: "Simulation: Route constructed sequentially for testing."
+    summary: "Simulation: Route constructed sequentially."
   };
 };
 

@@ -1,14 +1,13 @@
 import React, { useState } from 'react';
-import { 
-  Play, Trash2, Plus, ArrowRight, Package, RefreshCcw, 
-  Cpu, Map as MapIcon, Send, CheckSquare, Square 
+import {
+  Play, Trash2, Plus, ArrowRight, Package, RefreshCcw,
+  Cpu, Map as MapIcon, Send, CheckSquare, Square
 } from 'lucide-react';
 import { useTasks } from '../hooks/useTasks';
 import { supabase } from '../lib/supabaseClient';
-import { 
-  generateDistanceMatrix, 
-  formatTasksForSolver, 
-  mockSolveVRP 
+import {
+  generateDistanceMatrix,
+  mockSolveVRP
 } from '../utils/solverUtils';
 import { type DBNode, type DBEdge } from '../types/database';
 import RouteVisualizer from './RouteVisualizer';
@@ -20,7 +19,8 @@ import RouteVisualizer from './RouteVisualizer';
  */
 interface SolverRoute {
   vehicle_id: number;
-  nodes: number[];
+  steps: any[]; // Using any[] for now to match the flexible mock step structure
+  nodes?: number[]; // Keep for backward compatibility if needed
   distance: number;
 }
 
@@ -48,9 +48,9 @@ interface SolverSolution {
 const Optimization: React.FC = () => {
   // --- 1. DATA HOOKS ---
   const { tasks, locations, addTask, deleteTask, loading, refresh } = useTasks();
-  
+
   // --- 2. LOCAL STATE ---
-  
+
   // Form Inputs
   const [pickupId, setPickupId] = useState<string>("");
   const [deliveryId, setDeliveryId] = useState<string>("");
@@ -61,11 +61,11 @@ const Optimization: React.FC = () => {
 
   // Visualization Data
   const [showVisualizer, setShowVisualizer] = useState(false);
-  const [mapData, setMapData] = useState<{nodes: DBNode[], edges: DBEdge[]} | null>(null);
+  const [mapData, setMapData] = useState<{ nodes: DBNode[], edges: DBEdge[] } | null>(null);
 
   // Solver Status
   const [isSolving, setIsSolving] = useState(false);
-  
+
   // FIX: Updated state type from <any> to <SolverSolution | null>
   const [solution, setSolution] = useState<SolverSolution | null>(null);
 
@@ -86,11 +86,11 @@ const Optimization: React.FC = () => {
   const handleAdd = async () => {
     if (!pickupId || !deliveryId) return alert("Please select both Pickup and Delivery locations.");
     if (pickupId === deliveryId) return alert("Pickup and Delivery locations must be different.");
-    
+
     const success = await addTask(parseInt(pickupId), parseInt(deliveryId));
-    if (success) { 
-      setPickupId(""); 
-      setDeliveryId(""); 
+    if (success) {
+      setPickupId("");
+      setDeliveryId("");
     }
   };
 
@@ -98,37 +98,38 @@ const Optimization: React.FC = () => {
 
   const handleSolve = async () => {
     if (selectedTaskIds.size === 0) return alert("Please select at least one task to solve.");
-    
+
     setIsSolving(true);
     setSolution(null);
 
     try {
-      // Step A: Load Graph Context
+      // Step A: Load Graph Context (Nodes, Edges, Cells)
       const { data: graphData } = await supabase.from('wh_graphs').select('id').limit(1).single();
       const graphId = graphData?.id;
-      
+
       if (!graphId) throw new Error("No graph found active.");
 
       const { data: nodeData } = await supabase.from('wh_nodes').select('*').eq('graph_id', graphId);
       const { data: edgeData } = await supabase.from('wh_edges').select('*').eq('graph_id', graphId);
+      const { data: cellData } = await supabase.from('wh_cells').select('*').eq('graph_id', graphId);
 
-      if (!nodeData || !edgeData) throw new Error("Error loading map data.");
+      if (!nodeData || !edgeData || !cellData) throw new Error("Error loading map data.");
 
       setMapData({ nodes: nodeData as DBNode[], edges: edgeData as DBEdge[] });
 
       // Step B: Prepare Solver Payload
       const activeTasks = tasks.filter(t => selectedTaskIds.has(t.id));
       const matrix = generateDistanceMatrix(nodeData as DBNode[], edgeData as DBEdge[]);
-      const solverTasks = formatTasksForSolver(activeTasks, nodeData as DBNode[]);
-      
-      // Step C: Call Solver
-      console.log(`[Solver] Solving for ${vehicleCount} vehicles and ${solverTasks.length} tasks...`);
-      
-      // We cast the result to SolverSolution to ensure type safety
-      const result = await mockSolveVRP(matrix, solverTasks) as SolverSolution;
+      // const solverTasks = formatTasksForSolver(activeTasks, nodeData as DBNode[]);
+
+      // Step C: Call Solver (Pass Full Context for Simulation)
+      console.log(`[Solver] Solving for ${vehicleCount} vehicles and ${activeTasks.length} tasks...`);
+
+      // We cast the result to any because we changed the return type in utils but not the interface here yet
+      const result = await mockSolveVRP(matrix, activeTasks, nodeData as DBNode[], cellData) as unknown as SolverSolution;
 
       setSolution(result);
-      
+
     } catch (err: unknown) {
       console.error("Solver Error:", err);
       const msg = err instanceof Error ? err.message : "Unknown error";
@@ -140,22 +141,64 @@ const Optimization: React.FC = () => {
 
   const handleDispatch = async () => {
     if (!solution || selectedTaskIds.size === 0) return;
-    
+
     const confirm = window.confirm(`Dispatch ${vehicleCount} robots for these ${selectedTaskIds.size} tasks?`);
     if (!confirm) return;
 
-    const { error } = await supabase
-      .from('pd_pairs')
-      .update({ status: 'transporting' })
-      .in('id', Array.from(selectedTaskIds));
+    try {
+      // 1. Create Assignment
+      // TODO: In real app, we might have multiple routes/vehicles. Here we take the first route.
+      const route = solution.routes[0];
+      const steps = (route as any).steps || []; // Use 'any' to bypass TS check for now (RouteStep type)
 
-    if (error) {
-      alert("Error updating database during dispatch.");
-    } else {
-      alert("Orders dispatched to Fleet Controller successfully!");
+      const { data: assignmentData, error: assignError } = await supabase
+        .from('wh_assignments')
+        .insert({
+          robot_id: null, // Let Fleet Gateway assign a robot, or assign specific ID if solver provided reasonable one
+          original_seq: steps, // Store the full JSON plan
+          provider: 'user_vrp',
+          status: 'in_progress',
+          priority: 50
+        })
+        .select()
+        .single();
+
+      if (assignError) throw assignError;
+
+      // 2. Create Tasks (Sequence)
+      const tasksPayload = steps
+        .filter((s: any) => s.type === 'pickup' || s.type === 'dropoff')
+        .map((s: any, idx: number) => ({
+          assignment_id: assignmentData.id,
+          cell_id: s.cell_id,
+          retrieve: s.type === 'pickup', // True if pickup
+          status: 'on_another_delivery', // Initial status
+          seq_order: idx,
+          request_id: s.request_id
+        }));
+
+      if (tasksPayload.length > 0) {
+        const { error: taskError } = await supabase.from('wh_tasks').insert(tasksPayload);
+        if (taskError) throw taskError;
+      }
+
+      // 3. Update Request Status
+      const { error: reqError } = await supabase
+        .from('wh_requests')
+        .update({ status: 'in_progress' })
+        .in('id', Array.from(selectedTaskIds));
+
+      if (reqError) throw reqError;
+
+      alert("Orders dispatched successfully! Assignment #" + assignmentData.id + " created.");
       setSolution(null);
       setSelectedTaskIds(new Set());
-      refresh(); 
+      refresh();
+
+    } catch (err: unknown) {
+      console.error("Dispatch Error:", err);
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      alert(`Dispatch failed: ${msg}`);
     }
   };
 
@@ -163,7 +206,7 @@ const Optimization: React.FC = () => {
 
   return (
     <div className="flex h-full bg-slate-100 p-4 gap-4">
-      
+
       {/* PANEL 1: TASK QUEUE (LEFT) */}
       <div className="flex-1 bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col overflow-hidden">
         <div className="p-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
@@ -181,7 +224,7 @@ const Optimization: React.FC = () => {
         <div className="grid grid-cols-12 gap-2 px-4 py-2 bg-slate-50 text-[10px] font-bold text-slate-500 border-b">
           <div className="col-span-1 flex items-center">
             <button onClick={toggleAll}>
-               {selectedTaskIds.size > 0 && selectedTaskIds.size === tasks.length ? <CheckSquare size={14}/> : <Square size={14}/>}
+              {selectedTaskIds.size > 0 && selectedTaskIds.size === tasks.length ? <CheckSquare size={14} /> : <Square size={14} />}
             </button>
           </div>
           <div className="col-span-1">ID</div>
@@ -197,7 +240,7 @@ const Optimization: React.FC = () => {
             <div key={task.id} className={`grid grid-cols-12 gap-2 px-4 py-3 border-b border-slate-50 text-xs items-center ${selectedTaskIds.has(task.id) ? 'bg-blue-50/50' : ''}`}>
               <div className="col-span-1">
                 <button onClick={() => toggleTask(task.id)} className="text-slate-400 hover:text-blue-600">
-                  {selectedTaskIds.has(task.id) ? <CheckSquare size={14} className="text-blue-600"/> : <Square size={14}/>}
+                  {selectedTaskIds.has(task.id) ? <CheckSquare size={14} className="text-blue-600" /> : <Square size={14} />}
                 </button>
               </div>
               <div className="col-span-1 font-mono text-slate-400">#{task.id}</div>
@@ -211,7 +254,7 @@ const Optimization: React.FC = () => {
               <div className="col-span-3 font-medium">{task.delivery_name}</div>
               <div className="col-span-1 text-right">
                 <button onClick={() => deleteTask(task.id)} className="text-slate-300 hover:text-red-500">
-                  <Trash2 size={14}/>
+                  <Trash2 size={14} />
                 </button>
               </div>
             </div>
@@ -221,48 +264,48 @@ const Optimization: React.FC = () => {
 
       {/* PANEL 2: ACTIONS & SOLVER (RIGHT) */}
       <div className="w-80 flex flex-col gap-4">
-        
+
         {/* Module: Create New Task */}
         <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
-           <h3 className="text-sm font-bold text-slate-800 mb-4 flex items-center gap-2"><Plus size={16} className="text-blue-500"/> New Task</h3>
-           <div className="space-y-3">
-             <select className="w-full text-xs p-2 border rounded bg-slate-50" value={pickupId} onChange={e=>setPickupId(e.target.value)}>
-               <option value="">Pickup From...</option>
-               {locations.map(l => <option key={l.cell_id} value={l.cell_id}>{l.node_name} (L{l.level})</option>)}
-             </select>
-             <select className="w-full text-xs p-2 border rounded bg-slate-50" value={deliveryId} onChange={e=>setDeliveryId(e.target.value)}>
-               <option value="">Deliver To...</option>
-               {locations.map(l => <option key={l.cell_id} value={l.cell_id}>{l.node_name} (L{l.level})</option>)}
-             </select>
-             <button onClick={handleAdd} className="w-full py-2 bg-slate-800 text-white text-xs font-bold rounded hover:bg-slate-700 transition-colors">
-               ADD TO QUEUE
-             </button>
-           </div>
+          <h3 className="text-sm font-bold text-slate-800 mb-4 flex items-center gap-2"><Plus size={16} className="text-blue-500" /> New Task</h3>
+          <div className="space-y-3">
+            <select className="w-full text-xs p-2 border rounded bg-slate-50" value={pickupId} onChange={e => setPickupId(e.target.value)}>
+              <option value="">Pickup From...</option>
+              {locations.map(l => <option key={l.cell_id} value={l.cell_id}>{l.node_name} (L{l.level})</option>)}
+            </select>
+            <select className="w-full text-xs p-2 border rounded bg-slate-50" value={deliveryId} onChange={e => setDeliveryId(e.target.value)}>
+              <option value="">Deliver To...</option>
+              {locations.map(l => <option key={l.cell_id} value={l.cell_id}>{l.node_name} (L{l.level})</option>)}
+            </select>
+            <button onClick={handleAdd} className="w-full py-2 bg-slate-800 text-white text-xs font-bold rounded hover:bg-slate-700 transition-colors">
+              ADD TO QUEUE
+            </button>
+          </div>
         </div>
 
         {/* Module: VRP Solver Configuration */}
         <div className="bg-gradient-to-br from-blue-600 to-purple-700 p-5 rounded-xl shadow-md text-white">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-sm font-bold flex items-center gap-2"><Cpu size={18}/> VRP Solver</h3>
+            <h3 className="text-sm font-bold flex items-center gap-2"><Cpu size={18} /> VRP Solver</h3>
             <div className="flex items-center gap-2 bg-white/10 px-2 py-1 rounded">
-               <span className="text-[10px]">ROBOTS:</span>
-               <input 
-                 type="number" 
-                 min="1" 
-                 max="10" 
-                 value={vehicleCount} 
-                 onChange={(e) => setVehicleCount(parseInt(e.target.value))} 
-                 className="w-8 bg-transparent text-center font-bold text-xs outline-none border-b border-white/50" 
-               />
+              <span className="text-[10px]">ROBOTS:</span>
+              <input
+                type="number"
+                min="1"
+                max="10"
+                value={vehicleCount}
+                onChange={(e) => setVehicleCount(parseInt(e.target.value))}
+                className="w-8 bg-transparent text-center font-bold text-xs outline-none border-b border-white/50"
+              />
             </div>
           </div>
-          
-          <button 
-            onClick={handleSolve} 
-            disabled={isSolving || selectedTaskIds.size === 0} 
+
+          <button
+            onClick={handleSolve}
+            disabled={isSolving || selectedTaskIds.size === 0}
             className="w-full py-2 bg-white text-blue-700 text-xs font-bold rounded hover:bg-blue-50 flex justify-center gap-2 transition-all disabled:opacity-50"
           >
-            {isSolving ? "Solving..." : <><Play size={14} fill="currentColor"/> SOLVE SELECTED ({selectedTaskIds.size})</>}
+            {isSolving ? "Solving..." : <><Play size={14} fill="currentColor" /> SOLVE SELECTED ({selectedTaskIds.size})</>}
           </button>
         </div>
 
@@ -270,37 +313,37 @@ const Optimization: React.FC = () => {
         {solution && (
           <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 animate-in slide-in-from-bottom-2">
             <div className="flex justify-between items-center mb-3 border-b pb-2">
-               <h3 className="text-sm font-bold text-slate-800">Optimization Result</h3>
-               <span className="text-[10px] bg-green-100 text-green-700 px-2 py-0.5 rounded font-bold">FEASIBLE</span>
+              <h3 className="text-sm font-bold text-slate-800">Optimization Result</h3>
+              <span className="text-[10px] bg-green-100 text-green-700 px-2 py-0.5 rounded font-bold">FEASIBLE</span>
             </div>
             <div className="space-y-2 mb-4">
               <div className="flex justify-between text-xs"><span className="text-slate-500">Total Distance:</span> <span className="font-mono">{solution.total_distance} cm</span></div>
               <div className="flex justify-between text-xs"><span className="text-slate-500">Computation Time:</span> <span className="font-mono">{solution.wall_time_ms} ms</span></div>
             </div>
             <div className="flex gap-2">
-               <button 
-                 onClick={() => setShowVisualizer(true)} 
-                 className="flex-1 py-1.5 border border-slate-200 text-slate-600 hover:bg-slate-50 text-[10px] font-bold rounded flex justify-center gap-1 transition-colors"
-               >
-                 <MapIcon size={12}/> PREVIEW
-               </button>
-               <button 
-                 onClick={handleDispatch} 
-                 className="flex-1 py-1.5 bg-green-600 text-white hover:bg-green-700 text-[10px] font-bold rounded flex justify-center gap-1 transition-colors"
-               >
-                 <Send size={12}/> DISPATCH
-               </button>
+              <button
+                onClick={() => setShowVisualizer(true)}
+                className="flex-1 py-1.5 border border-slate-200 text-slate-600 hover:bg-slate-50 text-[10px] font-bold rounded flex justify-center gap-1 transition-colors"
+              >
+                <MapIcon size={12} /> PREVIEW
+              </button>
+              <button
+                onClick={handleDispatch}
+                className="flex-1 py-1.5 bg-green-600 text-white hover:bg-green-700 text-[10px] font-bold rounded flex justify-center gap-1 transition-colors"
+              >
+                <Send size={12} /> DISPATCH
+              </button>
             </div>
           </div>
         )}
       </div>
 
-      <RouteVisualizer 
-        isOpen={showVisualizer} 
-        onClose={() => setShowVisualizer(false)} 
-        solution={solution} 
-        dbNodes={mapData?.nodes || []} 
-        dbEdges={mapData?.edges || []} 
+      <RouteVisualizer
+        isOpen={showVisualizer}
+        onClose={() => setShowVisualizer(false)}
+        solution={solution}
+        dbNodes={mapData?.nodes || []}
+        dbEdges={mapData?.edges || []}
       />
     </div>
   );
