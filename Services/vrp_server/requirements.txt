@@ -1,5 +1,19 @@
-flask==3.0.0
-pandas==2.1.4
-ortools==9.8.3296
-requests==2.31.0
-flask-cors==4.0.0
+# VRP Solver Service Dependencies
+# ================================
+# Production-grade dependencies for the VRP Solver microservice.
+
+# Web Framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# Validation
+pydantic>=2.0.0
+
+# CORS
+# (included in FastAPI)
+
+# Optimization
+ortools>=9.8.0
+
+# Optional: Development
+python-dotenv>=1.0.0

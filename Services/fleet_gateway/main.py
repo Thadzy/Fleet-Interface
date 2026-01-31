@@ -1,232 +1,194 @@
-import os
-import time
-import json
+#!/usr/bin/env python3
+"""
+Fleet Gateway - Entry Point
+============================
+The Fleet Gateway is the central orchestration service for the Warehouse
+Controller System (WCS). It bridges the Supabase database with physical
+robots via MQTT.
+
+Architecture:
+    ┌─────────────┐     ┌─────────────────┐     ┌─────────────┐
+    │  Supabase   │────►│  Fleet Gateway  │────►│   Robots    │
+    │  Database   │◄────│  (This Service) │◄────│   (MQTT)    │
+    └─────────────┘     └─────────────────┘     └─────────────┘
+
+Responsibilities:
+    1. Poll database for active assignments.
+    2. Convert high-level tasks to robot commands (GOTO x, y).
+    3. Monitor robot positions and update task statuses.
+    4. Handle automatic reconnection for MQTT/Database.
+    5. Publish log messages for the Frontend UI.
+
+Usage:
+    python main.py
+
+Environment Variables (in .env):
+    VITE_SUPABASE_URL       - Supabase project URL
+    VITE_SUPABASE_ANON_KEY  - Supabase anonymous key
+
+Author: WCS Team
+Version: 2.0.0
+"""
+
 import asyncio
-from dotenv import load_dotenv
-from supabase import create_client, Client
-import paho.mqtt.client as mqtt
+import logging
+import signal
+import sys
 
-# --- LOAD CONFIG ---
-# Try to load from local .env first, then fallback to Frontend .env if possible
-load_dotenv() 
+from gateway import (
+    validate_config,
+    DatabaseClient,
+    MQTTHandler,
+    TaskOrchestrator,
+)
 
-# Supabase Config
-SUPABASE_URL = os.getenv("VITE_SUPABASE_URL") or os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("VITE_SUPABASE_ANON_KEY") or os.getenv("SUPABASE_KEY")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("ERROR: Supabase URL or Key not found. Please set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in .env")
-    # For dev convenience, we might hint looking at the frontend folder, 
-    # but for now we'll just fail gracefully or use placeholders if tested locally.
+# ============================================
+# LOGGING CONFIGURATION
+# ============================================
 
-# MQTT Config
-MQTT_BROKER = "broker.emqx.io"
-MQTT_PORT = 1883
-
-# --- GLOBAL STATE ---
-db: Client = None
-mqtt_client: mqtt.Client = None
-robot_status_cache = {} # { robot_id: { status, x, y } }
-
-# --- DATABASE HELPERS ---
-
-def init_db():
-    global db
-    if SUPABASE_URL and SUPABASE_KEY:
-        db = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("Connected to Supabase.")
-    else:
-        print("Warning: Database not connected.")
-
-def fetch_pending_assignments():
-    if not db: return []
-    try:
-        # Get 'in_progress' assignments that might need attention
-        response = db.table("wh_assignments").select("*").eq("status", "in_progress").execute()
-        return response.data
-    except Exception as e:
-        print(f"DB Error (fetch_assignments): {e}")
-        return []
-
-def fetch_assignment_tasks(assignment_id):
-    if not db: return []
-    try:
-        response = db.table("wh_tasks").select("*").eq("assignment_id", assignment_id).order("seq_order").execute()
-        return response.data
-    except Exception as e:
-        print(f"DB Error (fetch_tasks): {e}")
-        return []
-
-def update_task_status(task_id, status):
-    if not db: return
-    try:
-        db.table("wh_tasks").update({"status": status}).eq("id", task_id).execute()
-        print(f"[DB] Task {task_id} updated to {status}")
-    except Exception as e:
-        print(f"DB Error (update_task): {e}")
-
-def update_assignment_status(assignment_id, status):
-    if not db: return
-    try:
-        db.table("wh_assignments").update({"status": status}).eq("id", assignment_id).execute()
-        print(f"[DB] Assignment {assignment_id} updated to {status}")
-    except Exception as e:
-        print(f"DB Error (update_assignment): {e}")
-
-def fetch_node_position(cell_id):
-    if not db: return None
-    try:
-        # Get Cell -> Node -> x,y
-        # Supabase Python client join syntax is a bit specific, usually we do 2 queries or a view.
-        # Let's do 2 queries for simplicity/robustness in prototype.
-        cell_resp = db.table("wh_cells").select("node_id").eq("id", cell_id).single().execute()
-        if not cell_resp.data: return None
-        
-        node_id = cell_resp.data['node_id']
-        node_resp = db.table("wh_nodes").select("x,y,name").eq("id", node_id).single().execute()
-        return node_resp.data
-    except Exception as e:
-        print(f"DB Error (fetch_pos): {e}")
-        return None
-
-# --- MQTT HELPERS ---
-
-def on_mqtt_connect(client, userdata, flags, rc):
-    print(f"Connected to MQTT Broker (RC: {rc})")
-    client.subscribe("robots/+/status")
-
-def on_mqtt_message(client, userdata, msg):
-    try:
-        topic = msg.topic # robots/{id}/status
-        payload = json.loads(msg.payload.decode())
-        
-        # Parse Robot ID
-        parts = topic.split('/')
-        if len(parts) >= 2:
-            robot_id = parts[1]
-            robot_status_cache[robot_id] = payload
-            # print(f"Update Robot {robot_id}: {payload['status']}")
-            
-    except Exception as e:
-        print(f"MQTT Parse Error: {e}")
-
-def send_robot_command(robot_id, command_type, target_x, target_y):
-    topic = f"robots/{robot_id}/command"
-    payload = {
-        "command": command_type,
-        "target_x": target_x,
-        "target_y": target_y,
-        "timestamp": time.time()
-    }
-    mqtt_client.publish(topic, json.dumps(payload))
-    print(f"[MQTT] Sent {command_type} to Robot {robot_id} -> ({target_x}, {target_y})")
-
-# --- CORE LOGIC ---
-
-async def process_assignments():
-    """Watch assignments and dispatch tasks."""
-    print("Starting Assignment Processor Loop...")
+def setup_logging() -> None:
+    """
+    Configure logging for the Fleet Gateway.
     
-    while True:
-        assignments = fetch_pending_assignments()
-        
-        for asn in assignments:
-            # For each in-progress assignment, check its tasks
-            tasks = fetch_assignment_tasks(asn['id'])
-            
-            # Simple State Machine per Assignment
-            # Find the first non-completed task
-            current_task = next((t for t in tasks if t['status'] != 'completed'), None)
-            
-            if not current_task:
-                # All tasks completed?
-                if tasks and all(t['status'] == 'delivered' for t in tasks):
-                    update_assignment_status(asn['id'], 'completed')
-                continue
-
-            robot_id = str(asn['robot_id']) if asn['robot_id'] else "1" # Default to Robot 1 if null (Prototype hack)
-            
-            # What is the state of this task?
-            status = current_task['status']
-            
-            if status == 'on_another_delivery' or status == 'pending' or status == 'queuing': 
-                # Note: 'on_another_delivery' is the default insert status in current Optimization.tsx
-                # We transition to 'pickup_en_route' to indicate movement starts.
-                
-                print(f"Starting Task {current_task['id']} (Moving to Target)")
-                update_task_status(current_task['id'], 'pickup_en_route')
-                publish_log(f"Robot {robot_id} Started Task #{current_task['id']} (Moving)")
-                
-                # Get Target
-                target_cell = current_task['cell_id']
-                target_pos = fetch_node_position(target_cell)
-                
-                if target_pos:
-                    send_robot_command(robot_id, "GOTO", target_pos['x'], target_pos['y'])
-                else:
-                    print(f"Error: Unknown position for cell {target_cell}")
-            
-            elif status == 'pickup_en_route' or status == 'picking_up' or status == 'delivery_en_route':
-                # Check if Robot has arrived
-                # We need the robot's current position from MQTT cache
-                # robot_id is "1" (string) or 1 (int). Be careful with keys.
-                
-                bot_state = robot_status_cache.get(str(robot_id)) or robot_status_cache.get(int(robot_id))
-                
-                if bot_state:
-                    # Check Distance to Target
-                    target_cell = current_task['cell_id']
-                    target_pos = fetch_node_position(target_cell)
-                    
-                    if target_pos:
-                        dx = bot_state['x'] - target_pos['x']
-                        dy = bot_state['y'] - target_pos['y']
-                        dist = (dx**2 + dy**2)**0.5
-                        
-                        # Within 0.3 units (30cm) ?
-                        if dist < 0.3:
-                            print(f"Robot {robot_id} Arrived at Task {current_task['id']}")
-                            update_task_status(current_task['id'], 'delivered')
-                            publish_log(f"Robot {robot_id} Completed Task #{current_task['id']}")
-                            # The next loop iteration will pick up the next task
-                        elif bot_state['status'] == 'idle':
-                             # Robot stopped but not at target? Resend command!
-                             # This handles cases where the initial MQTT packet was lost or the robot was reset.
-                             print(f"Warning: Robot {robot_id} is IDLE but should be at {target_pos['x']},{target_pos['y']}. Resending GOTO.")
-                             send_robot_command(robot_id, "GOTO", target_pos['x'], target_pos['y'])
-        
-        await asyncio.sleep(2)
-
-def publish_log(msg):
-    """Publish a log message to the fleet/logs topic for the frontend."""
-    if mqtt_client:
-        payload = {
-            "msg": msg,
-            "timestamp": time.time()
-        }
-        mqtt_client.publish("fleet/logs", json.dumps(payload))
-        print(f"[LOG] {msg}") # Optional debug print
-
-def main():
-    # 1. Init DB
-    init_db()
+    Uses a clear format with timestamps for production debugging.
+    Logs are sent to both console and could be extended to file.
+    """
+    log_format = (
+        "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s"
+    )
     
-    # 2. Init MQTT
-    global mqtt_client
-    mqtt_client = mqtt.Client(client_id="fleet_gateway_v1")
-    mqtt_client.on_connect = on_mqtt_connect
-    mqtt_client.on_message = on_mqtt_message
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            # Uncomment to add file logging:
+            # logging.FileHandler("fleet_gateway.log"),
+        ]
+    )
     
-    print(f"Connecting to MQTT {MQTT_BROKER}...")
-    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    mqtt_client.loop_start()
+    # Reduce noise from third-party libraries
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-    # 3. Start Loop
+
+# ============================================
+# MAIN APPLICATION
+# ============================================
+
+logger = logging.getLogger(__name__)
+
+
+class FleetGateway:
+    """
+    Main application class that coordinates all Gateway components.
+    
+    This class handles:
+    - Component initialization
+    - Graceful shutdown on SIGINT/SIGTERM
+    - Error recovery
+    """
+    
+    def __init__(self):
+        self.db_client: DatabaseClient = None
+        self.mqtt_handler: MQTTHandler = None
+        self.orchestrator: TaskOrchestrator = None
+        self._shutdown_requested = False
+    
+    def initialize(self) -> bool:
+        """
+        Initialize all Gateway components.
+        
+        Returns:
+            True if all components initialized successfully.
+        """
+        # Validate configuration
+        if not validate_config():
+            logger.error("Configuration validation failed. Exiting.")
+            return False
+        
+        # Initialize Database
+        logger.info("Initializing Database connection...")
+        self.db_client = DatabaseClient()
+        if not self.db_client.connect():
+            logger.error("Failed to connect to database. Exiting.")
+            return False
+        
+        # Initialize MQTT
+        logger.info("Initializing MQTT connection...")
+        self.mqtt_handler = MQTTHandler()
+        if not self.mqtt_handler.connect():
+            logger.error("Failed to connect to MQTT broker. Exiting.")
+            return False
+        
+        # Initialize Orchestrator
+        self.orchestrator = TaskOrchestrator(
+            db_client=self.db_client,
+            mqtt_handler=self.mqtt_handler
+        )
+        
+        logger.info("Fleet Gateway initialized successfully! ✅")
+        return True
+    
+    async def run(self) -> None:
+        """Run the main orchestration loop."""
+        if not self.orchestrator:
+            raise RuntimeError("Gateway not initialized. Call initialize() first.")
+        
+        await self.orchestrator.run()
+    
+    def shutdown(self) -> None:
+        """Perform graceful shutdown of all components."""
+        logger.info("Shutting down Fleet Gateway...")
+        
+        if self.orchestrator:
+            self.orchestrator.stop()
+        
+        if self.mqtt_handler:
+            self.mqtt_handler.disconnect()
+        
+        logger.info("Fleet Gateway shutdown complete. Goodbye! 👋")
+
+
+def main() -> None:
+    """Main entry point for the Fleet Gateway."""
+    # Setup logging
+    setup_logging()
+    
+    logger.info("=" * 60)
+    logger.info("FLEET GATEWAY - Warehouse Controller System")
+    logger.info("Version 2.0.0")
+    logger.info("=" * 60)
+    
+    # Create application instance
+    gateway = FleetGateway()
+    
+    # Setup signal handlers for graceful shutdown
+    def signal_handler(sig, frame):
+        logger.info(f"Received signal {sig}. Initiating shutdown...")
+        gateway.shutdown()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Initialize and run
     try:
-        asyncio.run(process_assignments())
+        if not gateway.initialize():
+            sys.exit(1)
+        
+        asyncio.run(gateway.run())
+        
     except KeyboardInterrupt:
-        print("Stopping Gateway...")
-        mqtt_client.loop_stop()
+        logger.info("Keyboard interrupt received")
+        gateway.shutdown()
+    except Exception as e:
+        logger.exception(f"Fatal error: {e}")
+        gateway.shutdown()
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
