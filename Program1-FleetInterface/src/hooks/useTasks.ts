@@ -174,6 +174,17 @@ export const useTasks = () => {
   // 4. DELETE TASK (DELETE)
   // =========================================================
   const deleteTask = async (id: number) => {
+    // 1. Delete associated tasks first (Constraint Fix)
+    const { error: taskError } = await supabase.from('wh_tasks').delete().eq('request_id', id);
+    if (taskError) {
+      console.error("Task Cleanup Error:", taskError);
+      // Proceeding anyway might fail, but let's try or alert? 
+      // If we can't delete tasks, we certainly can't delete the request.
+      alert(`Failed to clean up associated tasks: ${taskError.message}`);
+      return;
+    }
+
+    // 2. Delete the request
     const { error } = await supabase.from('wh_requests').delete().eq('id', id);
 
     if (error) {

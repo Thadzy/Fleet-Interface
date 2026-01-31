@@ -147,7 +147,10 @@ const Optimization: React.FC = () => {
 
     try {
       // 1. Create Assignment
-      // TODO: In real app, we might have multiple routes/vehicles. Here we take the first route.
+      if (!solution.routes || solution.routes.length === 0) {
+        return alert("No valid route to dispatch. Please try solving again.");
+      }
+
       const route = solution.routes[0];
       const steps = (route as any).steps || []; // Use 'any' to bypass TS check for now (RouteStep type)
 
